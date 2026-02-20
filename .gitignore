@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.log
+.env
+.DS_Store
+
+# NÃO incluir arquivos com credenciais
+*-config.json
+.env.*
