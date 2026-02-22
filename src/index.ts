@@ -1524,3 +1524,200 @@ server.tool(
     }
   }
 );
+
+server.tool(
+  "trello_delete_checklist",
+  "Exclui um checklist de um card",
+  {
+    cardName: z.string().describe("Nome ou parte do nome do card"),
+    checklistName: z.string().describe("Nome do checklist a excluir"),
+    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
+  },
+  async ({ cardName, checklistName, boardUrl }) => {
+    const creds = getCredentials();
+    const boardId = await resolveBoardId(boardUrl, creds);
+    
+    const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
+    const searchName = cardName.toLowerCase().trim();
+    const card = allCards.find(c => 
+      c.name.toLowerCase().includes(searchName) || 
+      searchName.includes(c.name.toLowerCase())
+    );
+    
+    if (!card) {
+      return {
+        content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
+      };
+    }
+    
+    const checklists = await fetchTrelloWithCreds<TrelloChecklist[]>(creds, `/cards/${card.id}/checklists`);
+    const checklist = checklists.find(cl => 
+      cl.name.toLowerCase().includes(checklistName.toLowerCase())
+    );
+    
+    if (!checklist) {
+      return {
+        content: [{ type: "text", text: `❌ Checklist não encontrado: "${checklistName}"` }],
+      };
+    }
+    
+    try {
+      await fetchTrelloWithCreds(creds, `/checklists/${checklist.id}`, "DELETE");
+      
+      let text = `✅ **Checklist Excluído**\n\n`;
+      text += `🗑️ **${checklist.name}**\n`;
+      text += `📝 Itens removidos: ${checklist.checkItems.length}\n`;
+      text += `📌 Card: ${card.name}\n`;
+      text += `\n🔗 ${card.shortUrl}`;
+      
+      return { content: [{ type: "text", text }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `❌ Erro ao excluir checklist: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
+        }],
+      };
+    }
+  }
+);
+
+server.tool(
+  "trello_delete_checklist_item",
+  "Exclui um item específico de um checklist",
+  {
+    cardName: z.string().describe("Nome ou parte do nome do card"),
+    checklistName: z.string().describe("Nome do checklist"),
+    itemName: z.string().describe("Nome do item a excluir"),
+    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
+  },
+  async ({ cardName, checklistName, itemName, boardUrl }) => {
+    const creds = getCredentials();
+    const boardId = await resolveBoardId(boardUrl, creds);
+    
+    const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
+    const searchName = cardName.toLowerCase().trim();
+    const card = allCards.find(c => 
+      c.name.toLowerCase().includes(searchName) || 
+      searchName.includes(c.name.toLowerCase())
+    );
+    
+    if (!card) {
+      return {
+        content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
+      };
+    }
+    
+    const checklists = await fetchTrelloWithCreds<TrelloChecklist[]>(creds, `/cards/${card.id}/checklists`);
+    const checklist = checklists.find(cl => 
+      cl.name.toLowerCase().includes(checklistName.toLowerCase())
+    );
+    
+    if (!checklist) {
+      return {
+        content: [{ type: "text", text: `❌ Checklist não encontrado: "${checklistName}"` }],
+      };
+    }
+    
+    const item = checklist.checkItems.find(i => 
+      i.name.toLowerCase().includes(itemName.toLowerCase())
+    );
+    
+    if (!item) {
+      return {
+        content: [{ type: "text", text: `❌ Item não encontrado: "${itemName}"` }],
+      };
+    }
+    
+    try {
+      await fetchTrelloWithCreds(creds, `/checklists/${checklist.id}/checkItems/${item.id}`, "DELETE");
+      
+      let text = `✅ **Item Excluído**\n\n`;
+      text += `🗑️ ${item.name}\n`;
+      text += `📋 Checklist: ${checklist.name}\n`;
+      text += `📌 Card: ${card.name}\n`;
+      text += `\n🔗 ${card.shortUrl}`;
+      
+      return { content: [{ type: "text", text }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `❌ Erro ao excluir item: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
+        }],
+      };
+    }
+  }
+);
+
+server.tool(
+  "trello_update_checklist_item",
+  "Atualiza o estado de um item do checklist (marcar/desmarcar)",
+  {
+    cardName: z.string().describe("Nome ou parte do nome do card"),
+    checklistName: z.string().describe("Nome do checklist"),
+    itemName: z.string().describe("Nome do item"),
+    checked: z.boolean().describe("Marcar como concluído (true) ou pendente (false)"),
+    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
+  },
+  async ({ cardName, checklistName, itemName, checked, boardUrl }) => {
+    const creds = getCredentials();
+    const boardId = await resolveBoardId(boardUrl, creds);
+    
+    const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
+    const searchName = cardName.toLowerCase().trim();
+    const card = allCards.find(c => 
+      c.name.toLowerCase().includes(searchName) || 
+      searchName.includes(c.name.toLowerCase())
+    );
+    
+    if (!card) {
+      return {
+        content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
+      };
+    }
+    
+    const checklists = await fetchTrelloWithCreds<TrelloChecklist[]>(creds, `/cards/${card.id}/checklists`);
+    const checklist = checklists.find(cl => 
+      cl.name.toLowerCase().includes(checklistName.toLowerCase())
+    );
+    
+    if (!checklist) {
+      return {
+        content: [{ type: "text", text: `❌ Checklist não encontrado: "${checklistName}"` }],
+      };
+    }
+    
+    const item = checklist.checkItems.find(i => 
+      i.name.toLowerCase().includes(itemName.toLowerCase())
+    );
+    
+    if (!item) {
+      return {
+        content: [{ type: "text", text: `❌ Item não encontrado: "${itemName}"` }],
+      };
+    }
+    
+    try {
+      await fetchTrelloWithCreds(creds, `/cards/${card.id}/checkItem/${item.id}`, "PUT", { 
+        state: checked ? "complete" : "incomplete"
+      });
+      
+      const status = checked ? "☑️" : "⬜";
+      let text = `✅ **Item Atualizado**\n\n`;
+      text += `${status} ${item.name}\n`;
+      text += `📋 Checklist: ${checklist.name}\n`;
+      text += `📌 Card: ${card.name}\n`;
+      text += `\n🔗 ${card.shortUrl}`;
+      
+      return { content: [{ type: "text", text }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `❌ Erro ao atualizar item: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
+        }],
+      };
+    }
+  }
+);
