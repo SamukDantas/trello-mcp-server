@@ -603,16 +603,18 @@ server.tool(
 
 server.tool(
   "trello_update_card",
-  "Atualiza um card existente (descrição, nome, lista, etc.)",
+  "Atualiza um card existente (descrição, nome, lista, labels, etc.)",
   {
-    cardId: z.string().describe("ID do card a atualizar"),
+    cardId: z.string().optional().describe("ID do card a atualizar"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     name: z.string().optional().describe("Novo título do card"),
     desc: z.string().optional().describe("Nova descrição do card"),
     listName: z.string().optional().describe("Nova lista: backlog, doing, testing, done, ou nome exato"),
+    labelIds: z.array(z.string()).optional().describe("IDs das labels a adicionar"),
+    labelNames: z.array(z.string()).optional().describe("Nomes das labels (alternativa aos IDs)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
-  async ({ cardId, cardName, name, desc, listName, boardUrl }) => {
+  async ({ cardId, cardName, name, desc, listName, labelIds, labelNames, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
@@ -635,7 +637,7 @@ server.tool(
     
     if (!targetCardId) {
       return {
-        content: [{ type: "text", text: `❌ ID do card não fornecido` }],
+        content: [{ type: "text", text: `❌ ID ou nome do card deve ser fornecido` }],
       };
     }
     
@@ -665,6 +667,27 @@ server.tool(
       }
     }
     
+    if (labelIds || labelNames) {
+      let finalLabelIds = labelIds || [];
+      
+      if (labelNames && labelNames.length > 0) {
+        const boardLabels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
+        for (const labelName of labelNames) {
+          const found = boardLabels.find(l => 
+            l.name.toLowerCase() === labelName.toLowerCase() ||
+            l.name.toLowerCase().includes(labelName.toLowerCase())
+          );
+          if (found && !finalLabelIds.includes(found.id)) {
+            finalLabelIds.push(found.id);
+          }
+        }
+      }
+      
+      if (finalLabelIds.length > 0) {
+        updateData.idLabels = finalLabelIds;
+      }
+    }
+    
     if (Object.keys(updateData).length === 0) {
       return {
         content: [{ type: "text", text: `❌ Nenhum campo para atualizar` }],
@@ -679,6 +702,7 @@ server.tool(
       if (name) text += `📌 Novo título: ${name}\n`;
       if (desc !== undefined) text += `📄 Descrição atualizada\n`;
       if (listName) text += `📋 Movido para: ${listName}\n`;
+      if (labelIds || labelNames) text += `🏷️ Labels atualizadas\n`;
       text += `\n🔗 ${card.shortUrl}`;
       
       return { content: [{ type: "text", text }] };
