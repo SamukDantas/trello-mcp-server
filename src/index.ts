@@ -676,7 +676,7 @@ server.tool(
     addLabelNames: z.array(z.string()).optional().describe("Array de nomes de labels para ADICIONAR às existentes (não remove outras)"),
     removeLabelIds: z.array(z.string()).optional().describe("Array de IDs de labels para REMOVER"),
     removeLabelNames: z.array(z.string()).optional().describe("Array de nomes de labels para REMOVER"),
-    due: z.string().optional().describe("Data de vencimento (ISO 8601 ou 'today', 'tomorrow', 'next week')"),
+    due: z.string().optional().describe("Data de vencimento (ISO 8601, 'today', 'tomorrow', 'next week', ou '' para remover"),
     dueComplete: z.boolean().optional().describe("Marcar data de vencimento como completa"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -768,20 +768,29 @@ server.tool(
     }
     
     // Handle due date
-    if (due) {
-      if (due === "today") {
+    if (due !== undefined) {
+      if (due === "") {
+        // Remover data de vencimento
+        updateData.due = "";
+        labelChanges.push("Data de vencimento removida");
+      } else if (due === "today") {
         updateData.due = new Date().toISOString();
+        labelChanges.push("Data de vencimento: hoje");
       } else if (due === "tomorrow") {
         const tomorrow = new Date();
         tomorrow.setDate(tomorrow.getDate() + 1);
         updateData.due = tomorrow.toISOString();
+        labelChanges.push("Data de vencimento: amanha");
       } else if (due === "next week") {
         const nextWeek = new Date();
         nextWeek.setDate(nextWeek.getDate() + 7);
         updateData.due = nextWeek.toISOString();
+        labelChanges.push("Data de vencimento: proxima semana");
       } else {
         updateData.due = due;
+        labelChanges.push(`Data de vencimento: ${due}`);
       }
+    }
       labelChanges.push(`Data de vencimento: ${due}`);
     }
     
