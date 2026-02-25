@@ -661,6 +661,253 @@ server.tool(
   }
 );
 
+server.tool(
+  "trello_update_card",
+  "Atualiza um card existente (move de lista, atualiza nome, descrição, etc)",
+  {
+    cardId: z.string().optional().describe("ID do card a atualizar"),
+    cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
+    listName: z.string().optional().describe("Nome da lista: backlog, doing, testing, done, Concluído, Defeito, ou nome exato"),
+    name: z.string().optional().describe("Novo título do card"),
+    desc: z.string().optional().describe("Nova descrição"),
+    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
+  },
+  async ({ cardId, cardName, listName, name, desc, boardUrl }) => {
+    const creds = getCredentials();
+    const boardId = await resolveBoardId(boardUrl, creds);
+    
+    let targetCardId = cardId;
+    
+    if (!targetCardId && cardName) {
+      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
+      const searchName = cardName.toLowerCase().trim();
+      const card = allCards.find(c => 
+        c.name.toLowerCase().includes(searchName) || 
+        searchName.includes(c.name.toLowerCase())
+      );
+      
+      if (!card) {
+        return {
+          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
+        };
+      }
+      targetCardId = card.id;
+    }
+    
+    if (!targetCardId) {
+      return {
+        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
+      };
+    }
+    
+    const updateData: Record<string, unknown> = {};
+    
+    if (name) updateData.name = name;
+    if (desc !== undefined) updateData.desc = desc;
+    
+    if (listName) {
+      const lists = await fetchTrelloWithCreds<TrelloList[]>(creds, `/boards/${boardId}/lists`);
+      const normalizedListName = listName.toLowerCase().trim();
+      
+      let targetListId: string | undefined;
+      
+      const listAliases: Record<string, string[]> = {
+        "backlog": ["backlog", "a fazer", "to do"],
+        "doing": ["doing", "fazendo", "em andamento", "in progress"],
+        "testing": ["testing", "em teste", "teste", "review", "revisão"],
+        "done": ["done", "concluído", "concluido", "completo", "finalizado"],
+        "defeito": ["defeito", "bug", "problema"],
+        "planejado": ["planejado", "planned"]
+      };
+      
+      for (const [key, aliases] of Object.entries(listAliases)) {
+        if (aliases.some(alias => normalizedListName.includes(alias))) {
+          const foundList = lists.find(l => aliases.some(alias => l.name.toLowerCase().includes(alias)));
+          if (foundList) {
+            targetListId = foundList.id;
+            break;
+          }
+        }
+      }
+      
+      if (!targetListId) {
+        const exactMatch = lists.find(l => l.name.toLowerCase() === normalizedListName);
+        if (exactMatch) targetListId = exactMatch.id;
+      }
+      
+      if (!targetListId) {
+        const partialMatch = lists.find(l => l.name.toLowerCase().includes(normalizedListName));
+        if (partialMatch) targetListId = partialMatch.id;
+      }
+      
+      if (targetListId) {
+        updateData.idList = targetListId;
+      } else {
+        return {
+          content: [{ type: "text", text: `❌ Lista não encontrada: "${listName}"` }],
+        };
+      }
+    }
+    
+    if (Object.keys(updateData).length === 0) {
+      return {
+        content: [{ type: "text", text: "❌ Nenhum campo para atualizar" }],
+      };
+    }
+    
+    try {
+      const card = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}`, "PUT", updateData);
+      
+      let text = `✅ **Card Atualizado**\n\n`;
+      text += `🆔 ${targetCardId}\n`;
+      if (name) text += `📌 Título: ${name}\n`;
+      if (desc !== undefined) text += `📄 Descrição atualizada\n`;
+      if (listName) text += `📋 Movido para: ${listName}\n`;
+      text += `\n🔗 ${card.shortUrl}`;
+      
+      return { content: [{ type: "text", text }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `❌ Erro ao atualizar card: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
+        }],
+      };
+    }
+  }
+);
+
+server.tool(
+  "trello_get_card_details",
+  "Busca detalhes de um card do Trello",
+  {
+    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
+    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
+  },
+  async ({ cardId, cardName, boardUrl }) => {
+    const creds = getCredentials();
+    const boardId = await resolveBoardId(boardUrl, creds);
+    
+    let targetCardId = cardId;
+    
+    if (!targetCardId && cardName) {
+      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
+      const searchName = cardName.toLowerCase().trim();
+      const card = allCards.find(c => 
+        c.name.toLowerCase().includes(searchName) || 
+        searchName.includes(c.name.toLowerCase())
+      );
+      
+      if (!card) {
+        return {
+          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
+        };
+      }
+      targetCardId = card.id;
+    }
+    
+    if (!targetCardId) {
+      return {
+        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
+      };
+    }
+    
+    try {
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=all&actions=all&board=true&lists=all&labels=all`);
+      
+      let output = `📌 **${cardDetails.name}**\n\n`;
+      output += `🆔 ID: ${cardDetails.id}\n`;
+      if (cardDetails.desc) output += `📄 Descrição: ${cardDetails.desc.substring(0, 100)}...\n`;
+      output += `🔗 ${cardDetails.shortUrl}\n`;
+      
+      if (cardDetails.labels && cardDetails.labels.length > 0) {
+        output += `\n🏷️ Labels: ${cardDetails.labels.map(l => l.name).join(', ')}\n`;
+      }
+      
+      return { content: [{ type: "text", text: output }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `❌ Erro ao buscar card: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
+        }],
+      };
+    }
+  }
+);
+
+server.tool(
+  "trello_get_comments",
+  "Busca comentários de um card do Trello",
+  {
+    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
+    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
+  },
+  async ({ cardId, cardName, boardUrl }) => {
+    const creds = getCredentials();
+    const boardId = await resolveBoardId(boardUrl, creds);
+    
+    let targetCardId = cardId;
+    
+    if (!targetCardId && cardName) {
+      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
+      const searchName = cardName.toLowerCase().trim();
+      const card = allCards.find(c => 
+        c.name.toLowerCase().includes(searchName) || 
+        searchName.includes(c.name.toLowerCase())
+      );
+      
+      if (!card) {
+        return {
+          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
+        };
+      }
+      targetCardId = card.id;
+    }
+    
+    if (!targetCardId) {
+      return {
+        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
+      };
+    }
+    
+    try {
+      const comments = await fetchTrelloWithCreds<TrelloComment[]>(creds, `/cards/${targetCardId}/actions?filter=commentCard`);
+      
+      if (!comments || comments.length === 0) {
+        return {
+          content: [{ type: "text", text: "💬 Nenhum comentário encontrado neste card" }],
+        };
+      }
+      
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}`);
+      
+      let output = `💬 **Comentários do Card**\n\n`;
+      output += `📌 ${cardDetails.name}\n`;
+      output += `Total: ${comments.length} comentário(s)\n\n`;
+      
+      comments.forEach((comment, i) => {
+        const date = new Date(comment.date).toLocaleString("pt-BR");
+        const member = comment.memberCreator?.fullName || "Desconhecido";
+        output += `--- Comment ${i + 1} ---\n`;
+        output += `👤 ${member} • ${date}\n`;
+        output += `💭 ${comment.data.text}\n\n`;
+      });
+      
+      return { content: [{ type: "text", text: output }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `❌ Erro ao buscar comentários: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
+        }],
+      };
+    }
+  }
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
