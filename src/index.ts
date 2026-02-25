@@ -663,16 +663,24 @@ server.tool(
 
 server.tool(
   "trello_update_card",
-  "Atualiza um card existente (move de lista, atualiza nome, descrição, etc)",
+  "Atualiza um card existente (move de lista, atualiza nome, descrição, etiquetas, etc)",
   {
     cardId: z.string().optional().describe("ID do card a atualizar"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     listName: z.string().optional().describe("Nome da lista: backlog, doing, testing, done, Concluído, Defeito, ou nome exato"),
     name: z.string().optional().describe("Novo título do card"),
     desc: z.string().optional().describe("Nova descrição"),
+    labelIds: z.array(z.string()).optional().describe("Array de IDs de labels para SUBSTITUIR todas as labels existentes"),
+    labelNames: z.array(z.string()).optional().describe("Array de nomes de labels para SUBSTITUIR todas as labels existentes"),
+    addLabelIds: z.array(z.string()).optional().describe("Array de IDs de labels para ADICIONAR às existentes (não remove outras)"),
+    addLabelNames: z.array(z.string()).optional().describe("Array de nomes de labels para ADICIONAR às existentes (não remove outras)"),
+    removeLabelIds: z.array(z.string()).optional().describe("Array de IDs de labels para REMOVER"),
+    removeLabelNames: z.array(z.string()).optional().describe("Array de nomes de labels para REMOVER"),
+    due: z.string().optional().describe("Data de vencimento (ISO 8601 ou 'today', 'tomorrow', 'next week')"),
+    dueComplete: z.boolean().optional().describe("Marcar data de vencimento como completa"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
-  async ({ cardId, cardName, listName, name, desc, boardUrl }) => {
+  async ({ cardId, cardName, listName, name, desc, labelIds, labelNames, addLabelIds, addLabelNames, removeLabelIds, removeLabelNames, due, dueComplete, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
@@ -700,10 +708,88 @@ server.tool(
       };
     }
     
+    // Buscar labels atuais do card (sem limitar campos para garantir que idLabels seja retornado)
+    const currentCard = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=idLabels,idBoard`);
+    const currentLabelIds = currentCard.idLabels || [];
+    
     const updateData: Record<string, unknown> = {};
+    const labelChanges: string[] = [];
     
     if (name) updateData.name = name;
     if (desc !== undefined) updateData.desc = desc;
+    
+    // Handle labels - modo substituição (comportamento original)
+    if (labelIds && labelIds.length > 0) {
+      updateData.idLabels = labelIds.join(",");
+      labelChanges.push(`Labels substituídas: ${labelIds.length}`);
+    } else if (labelNames && labelNames.length > 0) {
+      const boardLabels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
+      const labelIdsFromNames = boardLabels
+        .filter(l => labelNames.some(name => l.name.toLowerCase().includes(name.toLowerCase())))
+        .map(l => l.id);
+      updateData.idLabels = labelIdsFromNames.join(",");
+      labelChanges.push(`Labels substituídas por nomes: ${labelNames.join(", ")}`);
+    }
+    
+    // Handle labels - modo adicionar (não remove existentes)
+    let finalAddLabelIds: string[] = [];
+    if (addLabelIds && addLabelIds.length > 0) {
+      finalAddLabelIds = addLabelIds.filter(id => !currentLabelIds.includes(id));
+    }
+    if (addLabelNames && addLabelNames.length > 0) {
+      const boardLabels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
+      const labelIdsFromNames = boardLabels
+        .filter(l => addLabelNames.some(name => l.name.toLowerCase().includes(name.toLowerCase())))
+        .map(l => l.id);
+      finalAddLabelIds = [...finalAddLabelIds, ...labelIdsFromNames.filter(id => !currentLabelIds.includes(id))];
+    }
+    if (finalAddLabelIds.length > 0) {
+      const newLabelIds = [...currentLabelIds, ...finalAddLabelIds];
+      updateData.idLabels = newLabelIds.join(",");
+      labelChanges.push(`Labels adicionadas: ${finalAddLabelIds.length}`);
+    }
+    
+    // Handle labels - modo remover
+    let finalRemoveLabelIds: string[] = [];
+    if (removeLabelIds && removeLabelIds.length > 0) {
+      finalRemoveLabelIds = removeLabelIds;
+    }
+    if (removeLabelNames && removeLabelNames.length > 0) {
+      const boardLabels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
+      const labelIdsFromNames = boardLabels
+        .filter(l => removeLabelNames.some(name => l.name.toLowerCase().includes(name.toLowerCase())))
+        .map(l => l.id);
+      finalRemoveLabelIds = [...finalRemoveLabelIds, ...labelIdsFromNames];
+    }
+    if (finalRemoveLabelIds.length > 0) {
+      const remainingLabelIds = currentLabelIds.filter(id => !finalRemoveLabelIds.includes(id));
+      updateData.idLabels = remainingLabelIds.join(",");
+      labelChanges.push(`Labels removidas: ${finalRemoveLabelIds.length}`);
+    }
+    
+    // Handle due date
+    if (due) {
+      if (due === "today") {
+        updateData.due = new Date().toISOString();
+      } else if (due === "tomorrow") {
+        const tomorrow = new Date();
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        updateData.due = tomorrow.toISOString();
+      } else if (due === "next week") {
+        const nextWeek = new Date();
+        nextWeek.setDate(nextWeek.getDate() + 7);
+        updateData.due = nextWeek.toISOString();
+      } else {
+        updateData.due = due;
+      }
+      labelChanges.push(`Data de vencimento: ${due}`);
+    }
+    
+    // Handle dueComplete
+    if (dueComplete !== undefined) {
+      updateData.dueComplete = dueComplete;
+      labelChanges.push(dueComplete ? "Marcado como concluído" : "Marcado como pendente");
+    }
     
     if (listName) {
       const lists = await fetchTrelloWithCreds<TrelloList[]>(creds, `/boards/${boardId}/lists`);
@@ -751,7 +837,10 @@ server.tool(
     
     if (Object.keys(updateData).length === 0) {
       return {
-        content: [{ type: "text", text: "❌ Nenhum campo para atualizar" }],
+        content: [{ 
+          type: "text", 
+          text: `❌ Nenhum campo para atualizar. Forneça pelo menos um campo (name, desc, listName, labelIds, addLabelIds, addLabelNames, removeLabelIds, removeLabelNames, due, dueComplete).` 
+        }],
       };
     }
     
@@ -763,6 +852,12 @@ server.tool(
       if (name) text += `📌 Título: ${name}\n`;
       if (desc !== undefined) text += `📄 Descrição atualizada\n`;
       if (listName) text += `📋 Movido para: ${listName}\n`;
+      if (labelChanges.length > 0) {
+        text += `\n🏷️ **Alterações de labels:**\n`;
+        labelChanges.forEach(change => {
+          text += `  • ${change}\n`;
+        });
+      }
       text += `\n🔗 ${card.shortUrl}`;
       
       return { content: [{ type: "text", text }] };
