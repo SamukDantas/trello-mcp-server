@@ -602,452 +602,62 @@ server.tool(
 );
 
 server.tool(
-  "trello_update_card",
-  "Atualiza um card existente (descrição, nome, lista, labels, etc.)",
+  "trello_add_comment",
+  "Adiciona um comentário a um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card a atualizar"),
+    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    name: z.string().optional().describe("Novo título do card"),
-    desc: z.string().optional().describe("Nova descrição do card"),
-    listName: z.string().optional().describe("Nova lista: backlog, doing, testing, done, ou nome exato"),
-    labelIds: z.array(z.string()).optional().describe("IDs das labels a adicionar"),
-    labelNames: z.array(z.string()).optional().describe("Nomes das labels (alternativa aos IDs)"),
+    text: z.string().describe("Texto do comentário"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
-  async ({ cardId, cardName, name, desc, listName, labelIds, labelNames, boardUrl }) => {
+  async ({ cardId, cardName, text, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
     let targetCardId = cardId;
     
     if (!targetCardId && cardName) {
-      const cards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards`);
-      const card = cards.find(c => 
-        c.name.toLowerCase().includes(cardName.toLowerCase()) ||
-        c.id === cardName
+      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
+      const searchName = cardName.toLowerCase().trim();
+      const card = allCards.find(c => 
+        c.name.toLowerCase().includes(searchName) || 
+        searchName.includes(c.name.toLowerCase())
       );
-      if (card) {
-        targetCardId = card.id;
-      } else {
+      
+      if (!card) {
         return {
-          content: [{ type: "text", text: `❌ Card "${cardName}" não encontrado` }],
+          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
         };
       }
+      targetCardId = card.id;
     }
     
     if (!targetCardId) {
       return {
-        content: [{ type: "text", text: `❌ ID ou nome do card deve ser fornecido` }],
-      };
-    }
-    
-    const updateData: Record<string, unknown> = {};
-    
-    if (name) updateData.name = name;
-    if (desc !== undefined) updateData.desc = desc;
-    
-    if (listName) {
-      const detectedLists = await detectListIds(creds, boardId);
-      const listMap: Record<string, string> = {
-        "backlog": detectedLists.backlog,
-        "doing": detectedLists.doing,
-        "testing": detectedLists.testing,
-        "done": detectedLists.done,
-      };
-      const targetListId = listMap[listName.toLowerCase()];
-      
-      if (!targetListId) {
-        const lists = await getBoardLists(creds, boardId);
-        const list = lists.find(l => l.name.toLowerCase().includes(listName.toLowerCase()));
-        if (list) {
-          updateData.idList = list.id;
-        }
-      } else {
-        updateData.idList = targetListId;
-      }
-    }
-    
-    if (labelIds || labelNames) {
-      let finalLabelIds = labelIds || [];
-      
-      if (labelNames && labelNames.length > 0) {
-        const boardLabels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
-        for (const labelName of labelNames) {
-          const found = boardLabels.find(l => 
-            l.name.toLowerCase() === labelName.toLowerCase() ||
-            l.name.toLowerCase().includes(labelName.toLowerCase())
-          );
-          if (found && !finalLabelIds.includes(found.id)) {
-            finalLabelIds.push(found.id);
-          }
-        }
-      }
-      
-      if (finalLabelIds.length > 0) {
-        updateData.idLabels = finalLabelIds;
-      }
-    }
-    
-    if (Object.keys(updateData).length === 0) {
-      return {
-        content: [{ type: "text", text: `❌ Nenhum campo para atualizar` }],
+        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
       };
     }
     
     try {
-      const card = await fetchTrelloWithCreds<TrelloCard>(creds, `/cards/${targetCardId}`, "PUT", updateData);
+      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/actions/comments`, "POST", { text });
       
-      let text = `✅ **Card Atualizado**\n\n`;
-      text += `🆔 ${targetCardId}\n`;
-      if (name) text += `📌 Novo título: ${name}\n`;
-      if (desc !== undefined) text += `📄 Descrição atualizada\n`;
-      if (listName) text += `📋 Movido para: ${listName}\n`;
-      if (labelIds || labelNames) text += `🏷️ Labels atualizadas\n`;
-      text += `\n🔗 ${card.shortUrl}`;
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}`);
       
-      return { content: [{ type: "text", text }] };
+      let textPreview = text.length > 100 ? text.slice(0, 100) + "..." : text;
+      let textOutput = `💬 **Comentário Adicionado**\n\n`;
+      textOutput += `📌 Card: ${cardDetails.name}\n`;
+      textOutput += `💭 "${textPreview}"\n`;
+      textOutput += `\n🔗 ${cardDetails.shortUrl}`;
+      
+      return { content: [{ type: "text", text: textOutput }] };
     } catch (error) {
       return {
         content: [{
           type: "text",
-          text: `❌ Erro ao atualizar card: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
+          text: `❌ Erro ao adicionar comentário: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
         }],
       };
     }
-  }
-);
-
-server.tool(
-  "trello_list_all",
-  "Lista todas as tarefas de todas as listas do quadro",
-  {},
-  async () => {
-    const cfg = loadConfig();
-    const [cards, lists] = await Promise.all([
-      getAllCards(cfg),
-      getLists(cfg),
-    ]);
-    
-    const pontoFocalCards = cards.filter(c => c.idLabels.includes(cfg.labels.pontoFocal));
-    
-    if (!pontoFocalCards.length) {
-      return {
-        content: [{ type: "text", text: "✅ Nenhuma tarefa encontrada!" }],
-      };
-    }
-    
-    const listNames: Record<string, string> = {
-      [cfg.lists.backlog]: "📋 Backlog",
-      [cfg.lists.doing]: "🔄 Doing",
-      [cfg.lists.testing]: "🧪 Testing",
-      [cfg.lists.done]: "✅ Done",
-    };
-    
-    const grouped: Record<string, TrelloCard[]> = {};
-    pontoFocalCards.forEach(card => {
-      if (!grouped[card.idList]) grouped[card.idList] = [];
-      grouped[card.idList].push(card);
-    });
-    
-    let text = `📊 **Quadro Trello** (${pontoFocalCards.length} tarefas)\n\n`;
-    
-    for (const [listId, listCards] of Object.entries(grouped)) {
-      const listName = listNames[listId] || `📁 ${lists.find(l => l.id === listId)?.name || "Desconhecido"}`;
-      text += `${listName} (${listCards.length})\n`;
-      text += listCards.map(c => `  • ${c.name}`).join("\n");
-      text += "\n\n";
-    }
-    
-    return { content: [{ type: "text", text }] };
-  }
-);
-
-server.tool(
-  "trello_list_board_overview",
-  "Lista todas as listas do quadro com contagem de cards (visão geral)",
-  {
-    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional, usa o ativo se não informado)")
-  },
-  async ({ boardUrl }) => {
-    const cfg = loadConfig();
-    const creds = getCredentials();
-    const boardId = await resolveBoardId(boardUrl, creds);
-    
-    const [lists, boardCards] = await Promise.all([
-      getBoardLists(creds, boardId),
-      fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards`),
-    ]);
-    
-    const cardCounts: Record<string, number> = {};
-    boardCards.forEach(card => {
-      cardCounts[card.idList] = (cardCounts[card.idList] || 0) + 1;
-    });
-    
-    const totalCards = boardCards.length;
-    
-    let text = `📋 **QUADRO TRELLO - VISÃO GERAL**\n\n`;
-    text += `| Lista | Cards |\n`;
-    text += `|-------|:-----:|\n`;
-    
-    for (const list of lists) {
-      const count = cardCounts[list.id] || 0;
-      const icon = count > 0 ? '✓' : '○';
-      text += `| ${icon} **${list.name}** | ${count} |\n`;
-    }
-    
-    text += `\n**Total:** ${totalCards} cards\n`;
-    text += `\n🔗 https://trello.com/b/${boardId}`;
-    
-    return { content: [{ type: "text", text }] };
-  }
-);
-
-server.tool(
-  "trello_list_by_list",
-  "Lista todas as tarefas de uma lista específica (sem filtro de label)",
-  { 
-    listName: z.string().describe("Nome da lista: backlog, doing, testing, done"),
-    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional, usa o ativo se não informado)")
-  },
-  async ({ listName, boardUrl }) => {
-    const cfg = loadConfig();
-    const creds = getCredentials();
-    const boardId = await resolveBoardId(boardUrl, creds);
-    
-    let listId: string | undefined;
-    
-    if (boardId === cfg.boardId) {
-      const listMap: Record<string, string> = {
-        "backlog": cfg.lists.backlog,
-        "doing": cfg.lists.doing,
-        "testing": cfg.lists.testing,
-        "done": cfg.lists.done,
-      };
-      listId = listMap[listName.toLowerCase()];
-    }
-    
-    if (!listId) {
-      const detectedLists = await detectListIds(creds, boardId);
-      const listMap: Record<string, string> = {
-        "backlog": detectedLists.backlog,
-        "doing": detectedLists.doing,
-        "testing": detectedLists.testing,
-        "done": detectedLists.done,
-      };
-      listId = listMap[listName.toLowerCase()];
-    }
-    
-    if (!listId) {
-      const lists = await getBoardLists(creds, boardId);
-      const list = lists.find(l => l.name.toLowerCase().includes(listName.toLowerCase()));
-      if (list) {
-        listId = list.id;
-      }
-    }
-    
-    if (!listId) {
-      return {
-        content: [{ type: "text", text: `❌ Lista "${listName}" não encontrada. Use: backlog, doing, testing ou done` }],
-      };
-    }
-    
-    const [cards, lists] = await Promise.all([
-      fetchTrelloWithCreds<TrelloCard[]>(creds, `/lists/${listId}/cards`),
-      getBoardLists(creds, boardId),
-    ]);
-    
-    const list = lists.find(l => l.id === listId);
-    const boards = await fetchTrelloWithCreds<TrelloBoard[]>(creds, "/members/me/boards");
-    const board = boards.find(b => b.id === boardId);
-    
-    const listEmoji: Record<string, string> = {
-      "backlog": "📋",
-      "doing": "🔄",
-      "testing": "🧪",
-      "done": "✅",
-    };
-    
-    if (!cards.length) {
-      return {
-        content: [{ type: "text", text: `✅ Lista "${list?.name || listName}" está vazia!` }],
-      };
-    }
-    
-    const emoji = listEmoji[listName.toLowerCase()] || "📁";
-    let text = `📊 **${board?.name || "Quadro"}**\n\n`;
-    text += `${emoji} **${list?.name || listName}** (${cards.length} tarefas)\n\n`;
-    
-    for (const card of cards) {
-      text += `• ${card.name}\n`;
-      text += `  🔗 ${card.shortUrl}\n`;
-    }
-    
-    return { content: [{ type: "text", text }] };
-  }
-);
-
-server.tool(
-  "trello_get_card_details",
-  "Busca detalhes de uma tarefa: descrição, checklists, comentários, anexos, membros e labels",
-  { 
-    name: z.string().describe("Nome ou parte do nome da tarefa"),
-    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional, usa o ativo se não informado)")
-  },
-  async ({ name, boardUrl }) => {
-    const cfg = loadConfig();
-    const creds = getCredentials();
-    const boardId = await resolveBoardId(boardUrl, creds);
-    
-    const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-    const searchName = name.toLowerCase().trim();
-    const card = allCards.find(c => 
-      c.name.toLowerCase().includes(searchName) || 
-      searchName.includes(c.name.toLowerCase())
-    ) || null;
-    
-    if (!card) {
-      return {
-        content: [{ type: "text", text: `❌ Tarefa não encontrada: "${name}"` }],
-      };
-    }
-    
-    const [details, checklists, comments, attachments, boardLabels, lists, boards] = await Promise.all([
-      fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${card.id}`),
-      fetchTrelloWithCreds<TrelloChecklist[]>(creds, `/cards/${card.id}/checklists`),
-      fetchTrelloWithCreds<TrelloComment[]>(creds, `/cards/${card.id}/actions?filter=commentCard`),
-      fetchTrelloWithCreds<TrelloAttachment[]>(creds, `/cards/${card.id}/attachments`),
-      fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`),
-      getBoardLists(creds, boardId),
-      fetchTrelloWithCreds<TrelloBoard[]>(creds, "/members/me/boards"),
-    ]);
-    
-    const members = details.idMembers.length > 0 
-      ? await getMembers(cfg, details.idMembers) 
-      : [];
-    
-    const board = boards.find(b => b.id === boardId);
-    const list = lists.find(l => l.id === details.idList);
-    
-    const listEmoji: Record<string, string> = {
-      "backlog": "📋",
-      "doing": "🔄", 
-      "testing": "🧪",
-      "done": "✅",
-    };
-    
-    let listDisplayName = list?.name || "Desconhecido";
-    for (const [key, emoji] of Object.entries(listEmoji)) {
-      if (list?.name.toLowerCase().includes(key) || 
-          (key === "doing" && list?.name.toLowerCase().includes("fazendo")) ||
-          (key === "done" && (list?.name.toLowerCase().includes("concluído") || list?.name.toLowerCase().includes("concluido")))) {
-        listDisplayName = `${emoji} ${list.name}`;
-        break;
-      }
-    }
-    
-    let text = `📝 **${details.name}**\n`;
-    text += `🔗 ${details.shortUrl}\n`;
-    text += `📊 Quadro: ${board?.name || "Desconhecido"}\n`;
-    text += `📍 ${listDisplayName}\n`;
-    
-    if (details.due) {
-      const dueDate = new Date(details.due);
-      const now = new Date();
-      const isOverdue = dueDate < now;
-      text += `📅 Vencimento: ${dueDate.toLocaleDateString("pt-BR")} ${isOverdue ? "⚠️ ATRASADA" : ""}\n`;
-    }
-    
-    if (details.dateCreated) {
-      text += `🕐 Criada em: ${new Date(parseInt(details.dateCreated)).toLocaleString("pt-BR")}\n`;
-    }
-    
-    if (details.dateLastActivity) {
-      text += `🔄 Última atividade: ${new Date(details.dateLastActivity).toLocaleString("pt-BR")}\n`;
-    }
-    
-    text += `\n`;
-    
-    if (details.labels && details.labels.length > 0) {
-      text += `🏷️ **Labels:**\n`;
-      for (const label of details.labels) {
-        const emoji: Record<string, string> = {
-          green: "🟢",
-          yellow: "🟡",
-          orange: "🟠",
-          red: "🔴",
-          purple: "🟣",
-          blue: "🔵",
-          sky: "🌤️",
-          lime: "💚",
-          pink: "💗",
-          black: "⚫",
-        };
-        text += `  ${emoji[label.color] || "🏷️"} ${label.name || label.color}\n`;
-      }
-      text += `\n`;
-    }
-    
-    if (members.length > 0) {
-      text += `👥 **Membros (${members.length}):**\n`;
-      for (const member of members) {
-        text += `  • ${member.fullName} (@${member.username})\n`;
-      }
-      text += `\n`;
-    }
-    
-    if (details.desc && details.desc.trim()) {
-      text += `📄 **Descrição:**\n${details.desc}\n\n`;
-    }
-    
-    if (attachments.length > 0) {
-      text += `📎 **Anexos (${attachments.length}):**\n`;
-      for (const att of attachments.slice(0, 10)) {
-        const size = att.bytes ? ` (${(att.bytes / 1024).toFixed(1)} KB)` : "";
-        text += `  • ${att.name}${size}\n`;
-        text += `    🔗 ${att.url}\n`;
-      }
-      if (attachments.length > 10) {
-        text += `  ... e mais ${attachments.length - 10} anexos\n`;
-      }
-      text += `\n`;
-    }
-    
-    if (checklists.length > 0) {
-      let totalItems = 0;
-      let completedItems = 0;
-      for (const checklist of checklists) {
-        totalItems += checklist.checkItems.length;
-        completedItems += checklist.checkItems.filter(i => i.state === "complete").length;
-      }
-      
-      text += `✅ **Checklists** (${completedItems}/${totalItems}):\n`;
-      for (const checklist of checklists) {
-        const completed = checklist.checkItems.filter(i => i.state === "complete").length;
-        const total = checklist.checkItems.length;
-        const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
-        text += `\n  📋 ${checklist.name} (${completed}/${total}) - ${progress}%\n`;
-        for (const item of checklist.checkItems) {
-          const status = item.state === "complete" ? "☑️" : "⬜";
-          text += `    ${status} ${item.name}\n`;
-        }
-      }
-      text += `\n`;
-    }
-    
-    if (comments.length > 0) {
-      text += `💬 **Comentários (${comments.length}):**\n`;
-      const recentComments = comments.slice(0, 5);
-      for (const comment of recentComments) {
-        const date = new Date(comment.date).toLocaleString("pt-BR");
-        text += `\n  👤 ${comment.memberCreator.fullName} - ${date}\n`;
-        text += `  "${comment.data.text.slice(0, 300)}${comment.data.text.length > 300 ? "..." : ""}"\n`;
-      }
-      if (comments.length > 5) {
-        text += `\n  ... e mais ${comments.length - 5} comentários\n`;
-      }
-    }
-    
-    return { content: [{ type: "text", text }] };
   }
 );
 
