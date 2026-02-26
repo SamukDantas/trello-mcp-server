@@ -59,6 +59,15 @@ interface TrelloCardDetails {
     name: string;
     color: string;
   }[];
+  checklists?: {
+    id: string;
+    name: string;
+    checkItems: {
+      id: string;
+      name: string;
+      state: "complete" | "incomplete";
+    }[];
+  }[];
 }
 
 interface TrelloAttachment {
@@ -145,8 +154,13 @@ async function fetchTrelloWithCreds<T>(
   method: "GET" | "POST" | "PUT" | "DELETE" = "GET",
   body?: object
 ): Promise<T> {
-  const separator = endpoint.includes('?') ? '&' : '?';
-  const url = `https://api.trello.com/1${endpoint}${separator}key=${creds.apiKey}&token=${creds.token}`;
+  // Se j\u00e1 tem query string, n\u00e3o adicionar ?
+  let url = `https://api.trello.com/1${endpoint}`;
+  if (endpoint.includes('?')) {
+    url += `&key=${creds.apiKey}&token=${creds.token}`;
+  } else {
+    url += `?key=${creds.apiKey}&token=${creds.token}`;
+  }
   
   const res = await fetch(url, {
     method,
@@ -186,7 +200,16 @@ async function fetchTrello<T>(
 async function resolveBoardId(input: string | undefined, creds: TrelloCredentials): Promise<string> {
   if (!input) {
     const cfg = loadConfig();
-    return currentBoardId || cfg.boardId;
+    const boardId = currentBoardId || cfg.boardId;
+    
+    // Se o boardId não é um ObjectId de 24 caracteres, tentar resolver
+    if (!/^[a-f0-9]{24}$/i.test(boardId)) {
+      const boards = await fetchTrelloWithCreds<TrelloBoard[]>(creds, "/members/me/boards");
+      const board = boards.find(b => b.shortUrl.includes(boardId) || b.name.toLowerCase().includes(boardId.toLowerCase()));
+      if (board) return board.id;
+    }
+    
+    return boardId;
   }
   
   const extracted = extractBoardId(input);
@@ -676,7 +699,7 @@ server.tool(
     addLabelNames: z.array(z.string()).optional().describe("Array de nomes de labels para ADICIONAR às existentes (não remove outras)"),
     removeLabelIds: z.array(z.string()).optional().describe("Array de IDs de labels para REMOVER"),
     removeLabelNames: z.array(z.string()).optional().describe("Array de nomes de labels para REMOVER"),
-    due: z.string().optional().describe("Data de vencimento (ISO 8601, 'today', 'tomorrow', 'next week', ou '' para remover"),
+    due: z.string().optional().describe("Data de vencimento (ISO 8601, 'today', 'tomorrow', 'next week', ou 'remove' para remover"),
     dueComplete: z.boolean().optional().describe("Marcar data de vencimento como completa"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -769,9 +792,11 @@ server.tool(
     
     // Handle due date
     if (due !== undefined) {
-      if (due === "") {
-        // Remover data de vencimento
-        updateData.due = "";
+      if (due === "remove" || due === "") {
+        // Debug: mostrar que estamos tentando remover
+        console.log("[DEBUG] Tentando remover due do cartao");
+        // Enviar "none" para remover a data
+        updateData.due = "none";
         labelChanges.push("Data de vencimento removida");
       } else if (due === "today") {
         updateData.due = new Date().toISOString();
@@ -790,8 +815,6 @@ server.tool(
         updateData.due = due;
         labelChanges.push(`Data de vencimento: ${due}`);
       }
-    }
-      labelChanges.push(`Data de vencimento: ${due}`);
     }
     
     // Handle dueComplete
@@ -844,17 +867,35 @@ server.tool(
       }
     }
     
-    if (Object.keys(updateData).length === 0) {
+    // Permitir update se vamos remover a data (due=none)
+    const isDueRemoval = (updateData as any).due === "none";
+    if (Object.keys(updateData).length === 0 && !isDueRemoval) {
       return {
         content: [{ 
           type: "text", 
-          text: `❌ Nenhum campo para atualizar. Forneça pelo menos um campo (name, desc, listName, labelIds, addLabelIds, addLabelNames, removeLabelIds, removeLabelNames, due, dueComplete).` 
+          text: `❌ Nenhum campo para atualizar. Forneça pelo menos um campo (name, desc, listName, labelIds, addLabelIds, addLabelNames, removeLabelIds, removeLabelNames, due, dueComplete). Ex: due: "remove" para remover data` 
         }],
       };
     }
     
     try {
-      const card = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}`, "PUT", updateData);
+      let card;
+      
+      if ((updateData as any).due === "none") {
+        // Para remover due, usar query string via fetchTrelloWithCreds
+        const endpoint = `/cards/${targetCardId}?due=none`;
+        
+        let res = await fetch(`https://api.trello.com/1${endpoint}&key=${creds.apiKey}&token=${creds.token}`, { method: "PUT" });
+        
+        if (!res.ok) {
+          const errorText = await res.text();
+          throw new Error(`Trello API error: ${res.status} ${res.statusText} - ${errorText}`);
+        }
+        
+        card = await res.json();
+      } else {
+        card = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}`, "PUT", updateData);
+      }
       
       let text = `✅ **Card Atualizado**\n\n`;
       text += `🆔 ${targetCardId}\n`;
@@ -918,7 +959,7 @@ server.tool(
     }
     
     try {
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=all&actions=all&board=true&lists=all&labels=all`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=all&actions=all&board=true&lists=all&labels=all&checklists=all`);
       
       let output = `📌 **${cardDetails.name}**\n\n`;
       output += `🆔 ID: ${cardDetails.id}\n`;
@@ -927,6 +968,14 @@ server.tool(
       
       if (cardDetails.labels && cardDetails.labels.length > 0) {
         output += `\n🏷️ Labels: ${cardDetails.labels.map(l => l.name).join(', ')}\n`;
+      }
+      
+      if (cardDetails.checklists && cardDetails.checklists.length > 0) {
+        output += `\n📋 Checklists:\n`;
+        for (const checklist of cardDetails.checklists) {
+          const completed = checklist.checkItems.filter(i => i.state === 'complete').length;
+          output += `  - ${checklist.name} (${completed}/${checklist.checkItems.length})\n`;
+        }
       }
       
       return { content: [{ type: "text", text: output }] };
@@ -1320,6 +1369,94 @@ server.tool(
       text += `${emoji} **${name}**\n`;
       text += `   Cor: ${label.color || "padrão"}\n`;
       text += `   ID: ${label.id}\n\n`;
+    }
+    
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "trello_list_lists",
+  "Lista todas as listas de um quadro Trello",
+  {
+    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
+  },
+  async ({ boardUrl }) => {
+    const cfg = loadConfig();
+    const creds = getCredentials();
+    const boardId = await resolveBoardId(boardUrl, creds);
+    
+    const lists = await getBoardLists(creds, boardId);
+    
+    if (lists.length === 0) {
+      return {
+        content: [{ type: "text", text: "❌ Nenhuma lista encontrada no quadro" }],
+      };
+    }
+    
+    let text = `📋 **Listas do Quadro** (${lists.length})\n\n`;
+    
+    for (const list of lists) {
+      text += `• **${list.name}**\n`;
+      text += `  🆔 ${list.id}\n\n`;
+    }
+    
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "trello_list_cards_in_list",
+  "Lista os cards de uma lista específica do Trello",
+  {
+    listName: z.string().describe("Nome da lista (ex: Roadmap do Produto, Planejado, Backlog, Doing, Testing, Done)"),
+    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
+  },
+  async ({ listName, boardUrl }) => {
+    const cfg = loadConfig();
+    const creds = getCredentials();
+    const boardId = await resolveBoardId(boardUrl, creds);
+    
+    // Buscar todas as listas do board
+    const lists = await getBoardLists(creds, boardId);
+    
+    // Encontrar a lista pelo nome (busca parcial)
+    const normalizedSearchName = listName.toLowerCase().trim();
+    const foundList = lists.find(l => 
+      l.name.toLowerCase().includes(normalizedSearchName) ||
+      normalizedSearchName.includes(l.name.toLowerCase())
+    );
+    
+    if (!foundList) {
+      const availableLists = lists.map(l => l.name).join(", ");
+      return {
+        content: [{ 
+          type: "text", 
+          text: `❌ Lista "${listName}" não encontrada.\n\nListas disponíveis:\n${availableLists}` 
+        }],
+      };
+    }
+    
+    // Buscar todos os cards do board
+    const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
+    
+    // Filtrar apenas os cards da lista específica
+    const cardsInList = allCards.filter(c => c.idList === foundList.id);
+    
+    if (cardsInList.length === 0) {
+      return {
+        content: [{ 
+          type: "text", 
+          text: `📋 **${foundList.name}**\n\nNenhum card encontrado nesta lista.` 
+        }],
+      };
+    }
+    
+    let text = `📋 **${foundList.name}** (${cardsInList.length} cards)\n\n`;
+    
+    for (const card of cardsInList) {
+      text += `• ${card.name}\n`;
+      text += `  🔗 ${card.shortUrl}\n\n`;
     }
     
     return { content: [{ type: "text", text }] };
