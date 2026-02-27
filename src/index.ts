@@ -3960,61 +3960,6 @@ server.tool(
 );
 
 server.tool(
-  "trello_list_attachments",
-  "Lista os anexos de um card",
-  {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
-    cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
-  },
-  async ({ cardId, cardName, boardUrl }) => {
-    const creds = getCredentials();
-    const boardId = await resolveBoardId(boardUrl, creds);
-    
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
-    
-    try {
-      const attachments = await fetchTrelloWithCreds<TrelloAttachment[]>(creds, `/cards/${targetCardId}/attachments`);
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
-      
-      if (attachments.length === 0) {
-        return { content: [{ type: "text", text: `📎 Nenhum anexo neste card\n📌 ${cardDetails.name}` }] };
-      }
-      
-      let text = `📎 **Anexos do Card** (${attachments.length})\n\n📌 ${cardDetails.name}\n\n`;
-      
-      for (const att of attachments) {
-        const icon = att.mimeType?.startsWith("image/") ? "🖼️" : 
-                     att.mimeType?.includes("pdf") ? "📄" : "📎";
-        text += `${icon} **${att.name}**\n`;
-        text += `   Tipo: ${att.mimeType || "desconhecido"}\n`;
-        text += `   Data: ${att.date ? new Date(att.date).toLocaleDateString("pt-BR") : "desconhecida"}\n`;
-        text += `   🔗 ${att.url}\n\n`;
-      }
-      
-      return { content: [{ type: "text", text }] };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
-      };
-    }
-  }
-);
-
-server.tool(
   "trello_upload_attachment",
   "Faz upload de um anexo para um card",
   {
@@ -4135,69 +4080,6 @@ server.tool(
       text += `📎 Arquivo: ${targetAttachment.name}\n`;
       text += `📋 Tipo: ${targetAttachment.mimeType}\n`;
       text += `\n🔗 **URL de Download:**\n${targetAttachment.url}`;
-      
-      return { content: [{ type: "text", text }] };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
-      };
-    }
-  }
-);
-
-server.tool(
-  "trello_delete_attachment",
-  "Remove um anexo de um card",
-  {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
-    cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    attachmentId: z.string().optional().describe("ID do anexo (alternativa ao nome)"),
-    attachmentName: z.string().optional().describe("Nome do anexo (alternativa ao ID)"),
-    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
-  },
-  async ({ cardId, cardName, attachmentId, attachmentName, boardUrl }) => {
-    const creds = getCredentials();
-    const boardId = await resolveBoardId(boardUrl, creds);
-    
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
-    
-    try {
-      let attachments = await fetchTrelloWithCreds<TrelloAttachment[]>(creds, `/cards/${targetCardId}/attachments`);
-      
-      let targetAttachment: TrelloAttachment | undefined;
-      
-      if (attachmentId) {
-        targetAttachment = attachments.find(a => a.id === attachmentId);
-      } else if (attachmentName) {
-        targetAttachment = attachments.find(a => 
-          a.name.toLowerCase().includes(attachmentName.toLowerCase())
-        );
-      }
-      
-      if (!targetAttachment) {
-        return { content: [{ type: "text", text: "❌ Anexo não encontrado" }] };
-      }
-      
-      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/attachments/${targetAttachment.id}`, "DELETE");
-      
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
-      
-      let text = `✅ **Anexo Removido**\n\n`;
-      text += `📌 Card: ${cardDetails.name}\n`;
-      text += `📎 Arquivo: ${targetAttachment.name}`;
       
       return { content: [{ type: "text", text }] };
     } catch (error) {
