@@ -633,6 +633,7 @@ server.tool(
 );
 
 server.tool(
+  "trello_list_pending_backlog_tasks",
   "Lista todas as tarefas pendentes no backlog do Trello",
   { boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional, usa o ativo se não informado)") },
   async ({ boardUrl }) => {
