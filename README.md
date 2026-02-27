@@ -434,7 +434,7 @@ Se retornar uma lista de quadros, as credenciais estão corretas.
 
 ## Licença
 
-MIT License - Copyright (c) 2024
+MIT License - Copyright (c) 2026
 
 ---
 
