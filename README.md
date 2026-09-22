@@ -80,18 +80,13 @@ Crie o arquivo de configuração em `~/.config/opencode/trello-config.json`:
 {
   "apiKey": "SUA_API_KEY_AQUI",
   "token": "SEU_TOKEN_AQUI",
-  "boardId": "ID_DO_QUADRO_PADRAO",
-  "lists": {
-    "backlog": "ID_LISTA_BACKLOG",
-    "doing": "ID_LISTA_DOING",
-    "testing": "ID_LISTA_TESTING",
-    "done": "ID_LISTA_DONE"
-  },
-  "labels": {
-    "pontoFocal": "ID_LABEL"
-  }
+  "boardId": "ID_DO_QUADRO_PADRAO"
 }
 ```
+
+As propriedades antigas `lists` e `labels` não são utilizadas. Nenhum nome de
+coluna, ordem de listas ou etiqueta determina o fluxo. O `boardId` define somente
+o quadro padrão; `boardUrl` e `trello_set_board` permitem escolher outro quadro.
 
 ### Configuração no OpenCode
 
@@ -181,8 +176,10 @@ Isso irá mostrar todas as listas e seus IDs.
 | Função | Descrição |
 |--------|------------|
 | `trello_create_card` | Cria um novo card |
-| `trello_get_card` | Obtém detalhes de um card |
-| `trello_update_card` | Atualiza um card |
+| `trello_get_card_details` | Obtém detalhes de um card |
+| `trello_update_card` | Atualiza um card; movimentação exige listId ou listName exato |
+| `trello_move_card` | Move um card para a lista escolhida explicitamente |
+| `trello_mark_card_complete` | Conclui ou reabre um card, sem movimentação |
 | `trello_delete_card` | Exclui um card |
 
 ### Labels (Etiquetas)
@@ -222,7 +219,7 @@ Isso irá mostrar todas as listas e seus IDs.
 | `trello_set_due_date` | Define data de vencimento |
 | `trello_get_due_date` | Obtém data de vencimento |
 | `trello_remove_due_date` | Remove data de vencimento |
-| `trello_mark_due_complete` | Marca vencimento como completo |
+| `trello_mark_due_complete` | Marca o card como concluído ou pendente, inclusive sem vencimento |
 
 ### Membros
 
@@ -308,24 +305,47 @@ Isso irá mostrar todas as listas e seus IDs.
 
 ## Exemplos de Uso
 
-### Gerenciamento Básico de Tarefas
+### Gerenciamento de Cards
 
-```bash
-# Listar tarefas do backlog
-trello_list_by_list listName="backlog"
+Exemplos de chamadas MCP (não são comandos de terminal). Substitua os IDs pelos
+valores retornados nas listagens:
 
-# Criar nova tarefa
-trello_create_card name="Nova funcionalidade" desc="Descricao da tarefa"
-
-# Ver detalhes de uma tarefa
-trello_get_card cardName="Nova funcionalidade"
-
-# Mover tarefa para fazendo
-trello_next
-
-# Marcar tarefa como concluida
-trello_done
+```text
+trello_list_lists {}
+trello_list_cards_in_list {"listName":"Triagem"}
+trello_create_card {"name":"Novo pedido","listName":"Triagem","desc":"Descrição do pedido"}
+trello_move_card {"cardId":"ID_DO_CARD","listName":"Análise comercial"}
+trello_move_card {"cardId":"ID_DO_CARD","listId":"ID_DA_LISTA","boardUrl":"Quadro de destino"}
+trello_mark_card_complete {"cardId":"ID_DO_CARD","complete":true}
+trello_mark_card_complete {"cardId":"ID_DO_CARD","complete":false}
 ```
+
+Listas são selecionadas por ID ou nome exato (ignorando maiúsculas e espaços nas
+extremidades). Nomes repetidos exigem ID; informar ID e nome incompatíveis gera
+erro. Criação exige uma lista. Atualização só move quando `listId` ou `listName`
+é informado. A lista deve pertencer ao quadro selecionado. Para mover para outro
+quadro, selecione esse quadro como destino com `boardUrl` ou como ativo.
+Concluir altera apenas `dueComplete`, sem mover, comentar ou arquivar.
+
+### Migração dos atalhos antigos
+
+Os nomes legados continuam disponíveis, mas seus parâmetros mudaram. Chamadas
+sem card ou lista não escolhem mais uma tarefa ou coluna automaticamente.
+
+| Atalho | Parâmetros e comportamento atual |
+|--------|---------------------------------|
+| `trello_next` | `cardId` e `listId` ou `listName`; equivale a mover o card escolhido |
+| `trello_done` | `cardId` e `complete`; equivale a concluir/reabrir, sem movimentar |
+| `trello_status` | `cardId`; consulta o estado do card na API |
+| `trello_create` | `title` e `listId` ou `listName`; cria sem etiquetas automáticas |
+| `trello_list_pending_backlog_tasks` | `listId` ou `listName`; lista cards dessa lista, sem filtro de etiqueta |
+
+`trello_create_card`, `trello_list_cards_in_list`, `trello_update_list` e
+`trello_delete_list` também aceitam ID ou nome exato de lista.
+`trello_update_card` aceita nome exato do card ou ID; nomes de cards repetidos
+exigem ID. Nas operações em lote `trello_archive_all_cards` e
+`trello_delete_all_cards`, omitir ambos os filtros de lista opera no quadro
+inteiro; `confirm: true` continua obrigatório. Um filtro inválido gera erro.
 
 ### Trabalhando com Membros
 
@@ -445,3 +465,65 @@ Sinta-se livre para contribuir com este projeto! Abra issues e mande pull reques
 ---
 
 **Desenvolvido com amor para a comunidade OpenCode**
+
+## Recursos nativos adicionais
+
+As extensões abaixo usam a API REST oficial e ficam em `src/platform-tools.ts`.
+Foram priorizadas por cobrir lacunas do MCP: dados estruturados nos cards,
+recuperação de cards arquivados e acompanhamento individual.
+
+| Ferramenta | Uso |
+|-----------|-----|
+| `trello_list_custom_fields` | Lista campos do quadro com tipos e IDs das opções |
+| `trello_create_custom_field` | Cria campo text, number, date, checkbox ou list |
+| `trello_get_card_custom_fields` | Lê valores com nomes dos campos e opções |
+| `trello_set_card_custom_field` | Preenche ou limpa um campo do card |
+| `trello_list_archived_cards` | Lista cards arquivados com seus IDs |
+| `trello_set_card_archived` | Arquiva (`true`) ou restaura (`false`) um card |
+| `trello_set_card_subscription` | Acompanha ou deixa de acompanhar um card |
+
+As ferramentas de quadro aceitam `boardUrl` (URL, ID ou nome); quando omitido,
+usam o quadro ativo ou o padrão da configuração. As ferramentas de card exigem
+`cardId` de 24 caracteres, retornado pelas listagens, e operam diretamente nesse
+card, independentemente do quadro ativo. Não aceitam nomes parciais.
+
+Exemplos de chamadas MCP (nome da ferramenta seguido dos argumentos JSON):
+
+```text
+trello_create_custom_field {"name":"Prioridade","type":"list","options":["Alta","Média","Baixa"]}
+trello_list_custom_fields {}
+trello_set_card_custom_field {"cardId":"ID_DO_CARD","customFieldId":"ID_DO_CAMPO","value":"ID_DA_OPCAO"}
+trello_get_card_custom_fields {"cardId":"ID_DO_CARD"}
+trello_set_card_custom_field {"cardId":"ID_DO_CARD","customFieldId":"ID_DO_CAMPO","value":null}
+trello_list_archived_cards {}
+trello_set_card_archived {"cardId":"ID_DO_CARD","archived":false}
+trello_set_card_subscription {"cardId":"ID_DO_CARD","subscribed":true}
+```
+
+Substitua os IDs ilustrativos por IDs reais. Campos number recebem número JSON;
+checkbox recebe booleano; date recebe ISO 8601 com fuso (por exemplo,
+`2026-09-22T08:00:00-04:00`); list recebe o ID de uma opção existente.
+`null` limpa qualquer tipo de campo. A criação de campos list exige opções únicas;
+outros tipos não aceitam opções. O campo deve pertencer ao quadro do card.
+
+Campos personalizados dependem da disponibilidade do recurso e das permissões
+no quadro do Trello. As ferramentas retornam falhas com `isError: true`.
+Restaurar um card preserva sua lista original; se a lista estiver arquivada, ela
+precisa ser reaberta no Trello para voltar a aparecer no quadro. Acompanhar afeta
+somente o usuário autenticado e segue as regras de notificações do Trello.
+
+Referências oficiais:
+- [Campos personalizados](https://developer.atlassian.com/cloud/trello/guides/rest-api/getting-started-with-custom-fields/)
+- [API de campos personalizados](https://developer.atlassian.com/cloud/trello/rest/api-group-customfields/)
+- [API de cards](https://developer.atlassian.com/cloud/trello/rest/api-group-cards/)
+
+### Desenvolvimento e validação
+
+```bash
+npm run build
+npm test
+```
+
+Os testes usam clientes MCP em memória e via stdio, com respostas Trello simuladas.
+Não precisam de credenciais nem acessam quadros reais. Após compilar, reinicie o
+cliente MCP para carregar as novas ferramentas. O servidor passa a expor 79 ferramentas.

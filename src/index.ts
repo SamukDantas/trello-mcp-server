@@ -1,3 +1,6 @@
+import { registerWorkflowTools } from "./workflow-tools.js";
+import { selectList } from "./selection.js";
+import { registerPlatformTools } from "./platform-tools.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -9,15 +12,6 @@ interface TrelloConfig {
   apiKey: string;
   token: string;
   boardId: string;
-  lists: {
-    backlog: string;
-    doing: string;
-    testing: string;
-    done: string;
-  };
-  labels: {
-    pontoFocal: string;
-  };
 }
 
 interface TrelloBoard {
@@ -153,7 +147,6 @@ interface TrelloAction {
   };
 }
 
-let currentTask: TrelloCard | null = null;
 let currentBoardId: string | null = null;
 
 interface TrelloCredentials {
@@ -270,40 +263,6 @@ async function resolveBoardId(input: string | undefined, creds: TrelloCredential
 
 async function getBoardLists(creds: TrelloCredentials, boardId: string): Promise<TrelloList[]> {
   return fetchTrelloWithCreds<TrelloList[]>(creds, `/boards/${boardId}/lists`);
-}
-
-async function detectListIds(creds: TrelloCredentials, boardId: string): Promise<Record<string, string>> {
-  const lists = await getBoardLists(creds, boardId);
-  const listMap: Record<string, string> = {};
-  
-  for (const list of lists) {
-    const nameLower = list.name.toLowerCase();
-    if (nameLower.includes("backlog") || nameLower.includes("a fazer") || nameLower.includes("to do")) {
-      listMap.backlog = list.id;
-    } else if (nameLower.includes("doing") || nameLower.includes("fazendo") || nameLower.includes("em andamento") || nameLower.includes("in progress")) {
-      listMap.doing = list.id;
-    } else if (nameLower.includes("testing") || nameLower.includes("testando") || nameLower.includes("review") || nameLower.includes("revisão")) {
-      listMap.testing = list.id;
-    } else if (nameLower.includes("done") || nameLower.includes("concluído") || nameLower.includes("concluido") || nameLower.includes("finalizado") || nameLower.includes("completed")) {
-      listMap.done = list.id;
-    }
-  }
-  
-  if (lists.length >= 4 && Object.keys(listMap).length < 4) {
-    listMap.backlog = lists[0].id;
-    listMap.doing = lists[1].id;
-    listMap.testing = lists[2].id;
-    listMap.done = lists[3].id;
-  }
-  
-  return listMap;
-}
-
-async function getBacklogTasks(cfg: TrelloConfig): Promise<TrelloCard[]> {
-  const cards = await fetchTrello<TrelloCard[]>(cfg, `/boards/${cfg.boardId}/cards/open`);
-  return cards.filter(
-    (c) => c.idLabels.includes(cfg.labels.pontoFocal) && c.idList === cfg.lists.backlog
-  );
 }
 
 async function getAllCards(cfg: TrelloConfig): Promise<TrelloCard[]> {
@@ -632,190 +591,29 @@ server.tool(
   }
 );
 
-server.tool(
-  "trello_list_pending_backlog_tasks",
-  "Lista todas as tarefas pendentes no backlog do Trello",
-  { boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional, usa o ativo se não informado)") },
-  async ({ boardUrl }) => {
-    const cfg = loadConfig();
-    const creds = getCredentials();
-    const boardId = await resolveBoardId(boardUrl, creds);
-    
-    const cards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-    
-    if (boardId === cfg.boardId && cfg.labels.pontoFocal) {
-      const listIds = await detectListIds(creds, boardId);
-      const backlogId = listIds.backlog || cfg.lists.backlog;
-      const tasks = cards.filter(c => 
-        c.idLabels.includes(cfg.labels.pontoFocal) && c.idList === backlogId
-      );
-      
-      if (!tasks.length) {
-        return { content: [{ type: "text", text: "✅ Nenhuma tarefa pendente!" }] };
-      }
-      
-      const text = `📋 **Tarefas** (${tasks.length}):\n\n` + 
-        tasks.map((c, i) => `${i + 1}. ${c.name}`).join("\n");
-      
-      return { content: [{ type: "text", text }] };
-    }
-    
-    const listIds = await detectListIds(creds, boardId);
-    const backlogId = listIds.backlog;
-    
-    if (!backlogId) {
-      return { content: [{ type: "text", text: "❌ Lista de backlog não encontrada!" }] };
-    }
-    
-    const tasks = cards.filter(c => c.idList === backlogId);
-    
-    if (!tasks.length) {
-      return { content: [{ type: "text", text: "✅ Nenhuma tarefa pendente!" }] };
-    }
-    
-    const text = `📋 **Tarefas** (${tasks.length}):\n\n` + 
-      tasks.map((c, i) => `${i + 1}. ${c.name}`).join("\n");
-    
-    return { content: [{ type: "text", text }] };
-  }
-);
-
-server.tool(
-  "trello_next",
-  "Inicia a próxima tarefa do backlog (move para Doing)",
-  {},
-  async () => {
-    const cfg = loadConfig();
-    const tasks = await getBacklogTasks(cfg);
-    
-    if (!tasks.length) {
-      return {
-        content: [{ type: "text", text: "✅ Nenhuma tarefa disponível!" }],
-      };
-    }
-    
-    currentTask = tasks[0];
-    await fetchTrello(cfg, `/cards/${currentTask.id}`, "PUT", { idList: cfg.lists.doing });
-    
-    return {
-      content: [{
-        type: "text",
-        text: `🎯 **Iniciada:** ${currentTask.name}\n🔗 ${currentTask.shortUrl}`,
-      }],
-    };
-  }
-);
-
-server.tool(
-  "trello_status",
-  "Mostra a tarefa atual em andamento",
-  {},
-  async () => {
-    if (!currentTask) {
-      return {
-        content: [{ type: "text", text: "📌 Nenhuma tarefa em andamento" }],
-      };
-    }
-    
-    return {
-      content: [{
-        type: "text",
-        text: `📌 **Atual:** ${currentTask.name}\n🔗 ${currentTask.shortUrl}`,
-      }],
-    };
-  }
-);
-
-server.tool(
-  "trello_done",
-  "Marca a tarefa atual como concluída (move para Testing)",
-  {},
-  async () => {
-    if (!currentTask) {
-      return {
-        content: [{ type: "text", text: "⚠️ Nenhuma tarefa em andamento!" }],
-      };
-    }
-    
-    const cfg = loadConfig();
-    await fetchTrello(cfg, `/cards/${currentTask.id}/actions/comments`, "POST", {
-      text: `✅ Concluído em ${new Date().toLocaleString("pt-BR")}`,
-    });
-    await fetchTrello(cfg, `/cards/${currentTask.id}`, "PUT", { idList: cfg.lists.testing });
-    
-    const msg = `✅ **Concluída:** ${currentTask.name}`;
-    currentTask = null;
-    
-    return { content: [{ type: "text", text: msg }] };
-  }
-);
-
-server.tool(
-  "trello_create",
-  "Cria uma nova tarefa no backlog",
-  { title: z.string().describe("Título da tarefa") },
-  async ({ title }) => {
-    const cfg = loadConfig();
-    const card = await fetchTrello<TrelloCard>(cfg, "/cards", "POST", {
-      idList: cfg.lists.backlog,
-      name: title,
-      idLabels: [cfg.labels.pontoFocal],
-    });
-    
-    return {
-      content: [{
-        type: "text",
-        text: `✅ **Criada:** ${title}\n🔗 ${card.shortUrl}`,
-      }],
-    };
-  }
-);
+// Atalhos legados registrados em workflow-tools.ts com parâmetros explícitos.
 
 server.tool(
   "trello_create_card",
   "Cria um card completo com lista, labels e descrição personalizáveis",
   {
     name: z.string().describe("Título do card"),
-    listName: z.string().optional().describe("Nome da lista: backlog, doing, testing, done, ou nome exato. Padrão: backlog"),
+    listId: z.string().trim().min(1).optional().describe("ID da lista escolhida"),
+    listName: z.string().trim().min(1).optional().describe("Nome exato da lista; use listId se houver nomes repetidos"),
     labelIds: z.array(z.string()).optional().describe("IDs das labels a adicionar"),
     labelNames: z.array(z.string()).optional().describe("Nomes das labels (alternativa aos IDs)"),
     desc: z.string().optional().describe("Descrição do card (suporta Markdown)"),
     due: z.string().optional().describe("Data de vencimento (ISO format ou relativo como 'tomorrow')"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
-  async ({ name, listName, labelIds, labelNames, desc, due, boardUrl }) => {
+  async ({ name, listId, listName, labelIds, labelNames, desc, due, boardUrl }) => {
     const cfg = loadConfig();
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetListId: string;
-    
-    if (listName) {
-      const detectedLists = await detectListIds(creds, boardId);
-      const listMap: Record<string, string> = {
-        "backlog": detectedLists.backlog,
-        "doing": detectedLists.doing,
-        "testing": detectedLists.testing,
-        "done": detectedLists.done,
-      };
-      targetListId = listMap[listName.toLowerCase()];
-      
-      if (!targetListId) {
-        const lists = await getBoardLists(creds, boardId);
-        const list = lists.find(l => l.name.toLowerCase().includes(listName.toLowerCase()));
-        if (list) targetListId = list.id;
-      }
-      
-      if (!targetListId) {
-        return {
-          content: [{ type: "text", text: `❌ Lista "${listName}" não encontrada` }],
-        };
-      }
-    } else {
-      const detectedLists = await detectListIds(creds, boardId);
-      targetListId = detectedLists.backlog || cfg.lists.backlog;
-    }
-    
+    const destination = selectList(await getBoardLists(creds, boardId), listId, listName);
+    const targetListId = destination.id;
+
     let finalLabelIds = labelIds || [];
     
     if (labelNames && labelNames.length > 0) {
@@ -868,7 +666,7 @@ server.tool(
       
       let text = `✅ **Card Criado**\n\n`;
       text += `📌 **${name}**\n`;
-      text += `📋 Lista: ${list?.name || listName || "backlog"}\n`;
+      text += `📋 Lista: ${destination.name}\n`;
       if (desc) text += `📄 Descrição: ${desc.slice(0, 100)}${desc.length > 100 ? "..." : ""}\n`;
       if (finalLabelIds.length > 0) text += `🏷️ Labels: ${finalLabelIds.length}\n`;
       if (due) text += `📅 Vencimento: ${due}\n`;
@@ -952,8 +750,9 @@ server.tool(
   "Atualiza um card existente (move de lista, atualiza nome, descrição, etiquetas, etc)",
   {
     cardId: z.string().optional().describe("ID do card a atualizar"),
-    cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    listName: z.string().optional().describe("Nome da lista: backlog, doing, testing, done, Concluído, Defeito, ou nome exato"),
+    cardName: z.string().optional().describe("Nome exato do card (alternativa ao ID)"),
+    listId: z.string().trim().min(1).optional().describe("ID da lista escolhida"),
+    listName: z.string().trim().min(1).optional().describe("Nome exato da lista; use listId se houver nomes repetidos"),
     name: z.string().optional().describe("Novo título do card"),
     desc: z.string().optional().describe("Nova descrição"),
     labelIds: z.array(z.string()).optional().describe("Array de IDs de labels para SUBSTITUIR todas as labels existentes"),
@@ -963,10 +762,10 @@ server.tool(
     removeLabelIds: z.array(z.string()).optional().describe("Array de IDs de labels para REMOVER"),
     removeLabelNames: z.array(z.string()).optional().describe("Array de nomes de labels para REMOVER"),
     due: z.string().optional().describe("Data de vencimento (ISO 8601, 'today', 'tomorrow', 'next week', ou 'remove' para remover"),
-    dueComplete: z.boolean().optional().describe("Marcar data de vencimento como completa"),
+    dueComplete: z.boolean().optional().describe("Marcar o card como concluído, mesmo sem vencimento"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
-  async ({ cardId, cardName, listName, name, desc, labelIds, labelNames, addLabelIds, addLabelNames, removeLabelIds, removeLabelNames, due, dueComplete, boardUrl }) => {
+  async ({ cardId, cardName, listId, listName, name, desc, labelIds, labelNames, addLabelIds, addLabelNames, removeLabelIds, removeLabelNames, due, dueComplete, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
@@ -975,10 +774,9 @@ server.tool(
     if (!targetCardId && cardName) {
       const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
       const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
+      const matches = allCards.filter(c => c.name.trim().toLowerCase() === searchName);
+      if (matches.length > 1) throw new Error("Nome de card ambíguo; informe cardId");
+      const card = matches[0];
       
       if (!card) {
         return {
@@ -1056,10 +854,9 @@ server.tool(
     // Handle due date
     if (due !== undefined) {
       if (due === "remove" || due === "") {
-        // Debug: mostrar que estamos tentando remover
-        console.log("[DEBUG] Tentando remover due do cartao");
+        // stdout é reservado ao protocolo MCP.
         // Enviar "none" para remover a data
-        updateData.due = "none";
+        updateData.due = null;
         labelChanges.push("Data de vencimento removida");
       } else if (due === "today") {
         updateData.due = new Date().toISOString();
@@ -1086,85 +883,28 @@ server.tool(
       labelChanges.push(dueComplete ? "Marcado como concluído" : "Marcado como pendente");
     }
     
-    if (listName) {
-      const lists = await fetchTrelloWithCreds<TrelloList[]>(creds, `/boards/${boardId}/lists`);
-      const normalizedListName = listName.toLowerCase().trim();
-      
-      let targetListId: string | undefined;
-      
-      const listAliases: Record<string, string[]> = {
-        "backlog": ["backlog", "a fazer", "to do"],
-        "doing": ["doing", "fazendo", "em andamento", "in progress"],
-        "testing": ["testing", "em teste", "teste", "review", "revisão"],
-        "done": ["done", "concluído", "concluido", "completo", "finalizado"],
-        "defeito": ["defeito", "bug", "problema"],
-        "planejado": ["planejado", "planned"]
-      };
-      
-      for (const [key, aliases] of Object.entries(listAliases)) {
-        if (aliases.some(alias => normalizedListName.includes(alias))) {
-          const foundList = lists.find(l => aliases.some(alias => l.name.toLowerCase().includes(alias)));
-          if (foundList) {
-            targetListId = foundList.id;
-            break;
-          }
-        }
-      }
-      
-      if (!targetListId) {
-        const exactMatch = lists.find(l => l.name.toLowerCase() === normalizedListName);
-        if (exactMatch) targetListId = exactMatch.id;
-      }
-      
-      if (!targetListId) {
-        const partialMatch = lists.find(l => l.name.toLowerCase().includes(normalizedListName));
-        if (partialMatch) targetListId = partialMatch.id;
-      }
-      
-      if (targetListId) {
-        updateData.idList = targetListId;
-      } else {
-        return {
-          content: [{ type: "text", text: `❌ Lista não encontrada: "${listName}"` }],
-        };
-      }
+    if (listId !== undefined || listName !== undefined) {
+      updateData.idList = selectList(await getBoardLists(creds, boardId), listId, listName).id;
+      updateData.idBoard = boardId;
     }
-    
-    // Permitir update se vamos remover a data (due=none)
-    const isDueRemoval = (updateData as any).due === "none";
-    if (Object.keys(updateData).length === 0 && !isDueRemoval) {
+
+    if (Object.keys(updateData).length === 0) {
       return {
         content: [{ 
           type: "text", 
-          text: `❌ Nenhum campo para atualizar. Forneça pelo menos um campo (name, desc, listName, labelIds, addLabelIds, addLabelNames, removeLabelIds, removeLabelNames, due, dueComplete). Ex: due: "remove" para remover data` 
+          text: `❌ Nenhum campo para atualizar. Forneça pelo menos um campo (name, desc, listId, listName, labelIds, addLabelIds, addLabelNames, removeLabelIds, removeLabelNames, due, dueComplete). Ex: due: "remove" para remover data`
         }],
       };
     }
     
     try {
-      let card;
-      
-      if ((updateData as any).due === "none") {
-        // Para remover due, usar query string via fetchTrelloWithCreds
-        const endpoint = `/cards/${targetCardId}?due=none`;
-        
-        let res = await fetch(`https://api.trello.com/1${endpoint}&key=${creds.apiKey}&token=${creds.token}`, { method: "PUT" });
-        
-        if (!res.ok) {
-          const errorText = await res.text();
-          throw new Error(`Trello API error: ${res.status} ${res.statusText} - ${errorText}`);
-        }
-        
-        card = await res.json();
-      } else {
-        card = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}`, "PUT", updateData);
-      }
-      
+      const card = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}`, "PUT", updateData);
+
       let text = `✅ **Card Atualizado**\n\n`;
       text += `🆔 ${targetCardId}\n`;
       if (name) text += `📌 Título: ${name}\n`;
       if (desc !== undefined) text += `📄 Descrição atualizada\n`;
-      if (listName) text += `📋 Movido para: ${listName}\n`;
+      if (listId || listName) text += `📋 Movido para: ${listName || listId}\n`;
       if (labelChanges.length > 0) {
         text += `\n🏷️ **Alterações de labels:**\n`;
         labelChanges.forEach(change => {
@@ -1481,7 +1221,7 @@ server.tool(
 
 server.tool(
   "trello_mark_due_complete",
-  "Marca a data de vencimento de um card como concluída ou pendente",
+  "Marca um card como concluído ou pendente, mesmo sem vencimento; não move de lista",
   {
     cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
@@ -1517,26 +1257,15 @@ server.tool(
     }
     
     try {
-      const cardDetailsBefore = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,due`);
-      
-      if (!cardDetailsBefore.due) {
-        return {
-          content: [{ 
-            type: "text", 
-            text: `❌ Este card não tem data de vencimento definida.\n\nUse trello_set_due_date primeiro para definir uma data.`
-          }],
-        };
-      }
-      
       await fetchTrelloWithCreds(creds, `/cards/${targetCardId}`, "PUT", { dueComplete: complete });
       
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,due,dueComplete`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,due,dueComplete,shortUrl`);
       
       const status = complete ? "✅ Concluída" : "⏳ Pendente";
       
-      let text = `✅ **Data de Vencimento Atualizada**\n\n`;
+      let text = `✅ **Conclusão do Card Atualizada**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
-      text += `📅 Vencimento: ${new Date(cardDetails.due!).toLocaleString("pt-BR")}\n`;
+      if (cardDetails.due) text += `📅 Vencimento: ${new Date(cardDetails.due!).toLocaleString("pt-BR")}\n`;
       text += `📊 Status: ${status}\n`;
       text += `\n🔗 ${cardDetails.shortUrl}`;
       
@@ -1628,7 +1357,7 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch(console.error);
+
 
 // ==========================================
 // FERRAMENTAS DE EXCLUSÃO
@@ -1696,11 +1425,12 @@ server.tool(
   "trello_delete_all_cards",
   "Exclui todos os cards de uma lista específica ou de todo o quadro",
   {
-    listName: z.string().optional().describe("Nome da lista: backlog, doing, testing, done, ou nome exato. Se vazio, exclui do quadro todo"),
+    listId: z.string().trim().min(1).optional().describe("ID da lista; sem listId e listName, opera no quadro todo"),
+    listName: z.string().trim().min(1).optional().describe("Nome exato da lista; use listId se houver nomes repetidos"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
     confirm: z.boolean().describe("Confirmação obrigatória: true para executar a exclusão")
   },
-  async ({ listName, boardUrl, confirm }) => {
+  async ({ listId, listName, boardUrl, confirm }) => {
     if (!confirm) {
       return {
         content: [{
@@ -1717,50 +1447,14 @@ server.tool(
     let cardsToDelete: TrelloCard[] = [];
     let listDisplayName = "todo o quadro";
     
-    if (listName) {
-      let listId: string | undefined;
-      
-      if (boardId === cfg.boardId) {
-        const listMap: Record<string, string> = {
-          "backlog": cfg.lists.backlog,
-          "doing": cfg.lists.doing,
-          "testing": cfg.lists.testing,
-          "done": cfg.lists.done,
-        };
-        listId = listMap[listName.toLowerCase()];
-      }
-      
-      if (!listId) {
-        const detectedLists = await detectListIds(creds, boardId);
-        const listMap: Record<string, string> = {
-          "backlog": detectedLists.backlog,
-          "doing": detectedLists.doing,
-          "testing": detectedLists.testing,
-          "done": detectedLists.done,
-        };
-        listId = listMap[listName.toLowerCase()];
-      }
-      
-      if (!listId) {
-        const lists = await getBoardLists(creds, boardId);
-        const list = lists.find(l => l.name.toLowerCase().includes(listName.toLowerCase()));
-        if (list) listId = list.id;
-      }
-      
-      if (!listId) {
-        return {
-          content: [{ type: "text", text: `❌ Lista "${listName}" não encontrada` }],
-        };
-      }
-      
-      cardsToDelete = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/lists/${listId}/cards`);
-      const lists = await getBoardLists(creds, boardId);
-      const list = lists.find(l => l.id === listId);
-      listDisplayName = list?.name || listName;
+    if (listId !== undefined || listName !== undefined) {
+      const destination = selectList(await getBoardLists(creds, boardId), listId, listName);
+      cardsToDelete = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/lists/${destination.id}/cards`);
+      listDisplayName = destination.name;
     } else {
       cardsToDelete = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
     }
-    
+
     if (cardsToDelete.length === 0) {
       return {
         content: [{
@@ -1807,11 +1501,12 @@ server.tool(
   "trello_archive_all_cards",
   "Arquiva (fecha) todos os cards de uma lista ou do quadro todo - alternativa à exclusão",
   {
-    listName: z.string().optional().describe("Nome da lista: backlog, doing, testing, done. Se vazio, arquiva do quadro todo"),
+    listId: z.string().trim().min(1).optional().describe("ID da lista; sem listId e listName, opera no quadro todo"),
+    listName: z.string().trim().min(1).optional().describe("Nome exato da lista; use listId se houver nomes repetidos"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
     confirm: z.boolean().describe("Confirmação obrigatória: true para executar")
   },
-  async ({ listName, boardUrl, confirm }) => {
+  async ({ listId, listName, boardUrl, confirm }) => {
     if (!confirm) {
       return {
         content: [{
@@ -1828,38 +1523,14 @@ server.tool(
     let cardsToArchive: TrelloCard[] = [];
     let listDisplayName = "todo o quadro";
     
-    if (listName) {
-      let listId: string | undefined;
-      
-      const detectedLists = await detectListIds(creds, boardId);
-      const listMap: Record<string, string> = {
-        "backlog": detectedLists.backlog,
-        "doing": detectedLists.doing,
-        "testing": detectedLists.testing,
-        "done": detectedLists.done,
-      };
-      listId = listMap[listName.toLowerCase()];
-      
-      if (!listId) {
-        const lists = await getBoardLists(creds, boardId);
-        const list = lists.find(l => l.name.toLowerCase().includes(listName.toLowerCase()));
-        if (list) listId = list.id;
-      }
-      
-      if (!listId) {
-        return {
-          content: [{ type: "text", text: `❌ Lista "${listName}" não encontrada` }],
-        };
-      }
-      
-      cardsToArchive = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/lists/${listId}/cards`);
-      const lists = await getBoardLists(creds, boardId);
-      const list = lists.find(l => l.id === listId);
-      listDisplayName = list?.name || listName;
+    if (listId !== undefined || listName !== undefined) {
+      const destination = selectList(await getBoardLists(creds, boardId), listId, listName);
+      cardsToArchive = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/lists/${destination.id}/cards`);
+      listDisplayName = destination.name;
     } else {
       cardsToArchive = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
     }
-    
+
     if (cardsToArchive.length === 0) {
       return {
         content: [{
@@ -1971,34 +1642,17 @@ server.tool(
   "trello_list_cards_in_list",
   "Lista os cards de uma lista específica do Trello",
   {
-    listName: z.string().describe("Nome da lista (ex: Roadmap do Produto, Planejado, Backlog, Doing, Testing, Done)"),
+    listId: z.string().trim().min(1).optional().describe("ID da lista escolhida"),
+    listName: z.string().trim().min(1).optional().describe("Nome exato da lista; use listId se houver nomes repetidos"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
-  async ({ listName, boardUrl }) => {
+  async ({ listId, listName, boardUrl }) => {
     const cfg = loadConfig();
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    // Buscar todas as listas do board
-    const lists = await getBoardLists(creds, boardId);
-    
-    // Encontrar a lista pelo nome (busca parcial)
-    const normalizedSearchName = listName.toLowerCase().trim();
-    const foundList = lists.find(l => 
-      l.name.toLowerCase().includes(normalizedSearchName) ||
-      normalizedSearchName.includes(l.name.toLowerCase())
-    );
-    
-    if (!foundList) {
-      const availableLists = lists.map(l => l.name).join(", ");
-      return {
-        content: [{ 
-          type: "text", 
-          text: `❌ Lista "${listName}" não encontrada.\n\nListas disponíveis:\n${availableLists}` 
-        }],
-      };
-    }
-    
+    const foundList = selectList(await getBoardLists(creds, boardId), listId, listName);
+
     // Buscar todos os cards do board
     const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
     
@@ -2018,7 +1672,7 @@ server.tool(
     
     for (const card of cardsInList) {
       text += `• ${card.name}\n`;
-      text += `  🔗 ${card.shortUrl}\n\n`;
+      text += `  🆔 ${card.id}\n  🔗 ${card.shortUrl}\n\n`;
     }
     
     return { content: [{ type: "text", text }] };
@@ -2077,7 +1731,7 @@ server.tool(
   "Atualiza uma lista (coluna) existente do Trello",
   {
     listId: z.string().optional().describe("ID da lista (alternativa ao nome)"),
-    listName: z.string().optional().describe("Nome ou parte do nome da lista (alternativa ao ID)"),
+    listName: z.string().optional().describe("Nome exato da lista (alternativa ao ID)"),
     newName: z.string().optional().describe("Novo nome para a lista"),
     newPos: z.number().optional().describe("Nova posição da lista (número, 'top', 'bottom')"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
@@ -2086,34 +1740,9 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetListId = listId;
-    
-    if (!targetListId && listName) {
-      const lists = await getBoardLists(creds, boardId);
-      const searchName = listName.toLowerCase().trim();
-      const foundList = lists.find(l => 
-        l.name.toLowerCase().includes(searchName) || 
-        searchName.includes(l.name.toLowerCase())
-      );
-      
-      if (!foundList) {
-        const availableLists = lists.map(l => l.name).join(", ");
-        return {
-          content: [{ 
-            type: "text", 
-            text: `❌ Lista "${listName}" não encontrada.\n\nListas disponíveis:\n${availableLists}` 
-          }],
-        };
-      }
-      targetListId = foundList.id;
-    }
-    
-    if (!targetListId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça listId ou listName" }],
-      };
-    }
-    
+    const destination = selectList(await getBoardLists(creds, boardId), listId, listName);
+    const targetListId = destination.id;
+
     const updateData: Record<string, unknown> = {};
     
     if (newName) {
@@ -2166,43 +1795,17 @@ server.tool(
   "Exclui uma lista (coluna) de um quadro do Trello",
   {
     listId: z.string().optional().describe("ID da lista (alternativa ao nome)"),
-    listName: z.string().optional().describe("Nome ou parte do nome da lista (alternativa ao ID)"),
+    listName: z.string().optional().describe("Nome exato da lista (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ listId, listName, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetListId = listId;
-    let listNameDeleted = listName || "Lista";
-    
-    if (!targetListId && listName) {
-      const lists = await getBoardLists(creds, boardId);
-      const searchName = listName.toLowerCase().trim();
-      const foundList = lists.find(l => 
-        l.name.toLowerCase().includes(searchName) || 
-        searchName.includes(l.name.toLowerCase())
-      );
-      
-      if (!foundList) {
-        const availableLists = lists.map(l => l.name).join(", ");
-        return {
-          content: [{ 
-            type: "text", 
-            text: `❌ Lista "${listName}" não encontrada.\n\nListas disponíveis:\n${availableLists}` 
-          }],
-        };
-      }
-      targetListId = foundList.id;
-      listNameDeleted = foundList.name;
-    }
-    
-    if (!targetListId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça listId ou listName" }],
-      };
-    }
-    
+    const destination = selectList(await getBoardLists(creds, boardId), listId, listName);
+    const targetListId = destination.id;
+    const listNameDeleted = destination.name;
+
     try {
       await fetchTrelloWithCreds(creds, `/lists/${targetListId}`, "DELETE");
       
@@ -4574,3 +4177,15 @@ server.tool(
     }
   }
 );
+
+registerPlatformTools(server, {
+  request: (endpoint, method, body) => fetchTrelloWithCreds(getCredentials(), endpoint, method, body),
+  resolveBoard: (input) => resolveBoardId(input, getCredentials()),
+});
+
+registerWorkflowTools(server, {
+  request: (endpoint, method, body) => fetchTrelloWithCreds(getCredentials(), endpoint, method, body),
+  resolveBoard: (input) => resolveBoardId(input, getCredentials()),
+});
+
+main().catch(console.error);
