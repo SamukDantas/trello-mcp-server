@@ -418,6 +418,14 @@ trello_create_from_template name="Novo Projeto" templateId="id_do_template"
 
 ## Solução de Problemas
 
+### Erro: "fetch failed" / falha HTTPS
+
+O MCP inclui automaticamente os certificados confiáveis do sistema junto das CAs padrão do Node.js quando o runtime oferece `tls.getCACertificates` e `tls.setDefaultCACertificates`. Isso permite usar redes com uma CA local confiável sem desativar a validação HTTPS. Recomendamos Node.js 24 LTS para esse suporte.
+
+Em runtimes antigos, atualize o Node.js ou configure `NODE_EXTRA_CA_CERTS` com o caminho de um arquivo PEM contendo a CA confiável da sua rede antes de iniciar o MCP. Reinicie a conexão MCP após atualizar.
+
+Falhas de rede agora informam o código da causa (por exemplo, `UNABLE_TO_VERIFY_LEAF_SIGNATURE` ou `ENOTFOUND`), sem expor a API key ou o token. Erros de certificado expirado ou hostname incorreto exigem corrigir o certificado.
+
 ### Erro: "API Key inválida"
 
 - Verifique se a API Key está correta no arquivo de configuração

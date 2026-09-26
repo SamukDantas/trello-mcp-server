@@ -1,3 +1,4 @@
+import { configureSystemCertificateTrust, requestTrello } from "./network.js";
 import { registerWorkflowTools } from "./workflow-tools.js";
 import { selectList } from "./selection.js";
 import { registerPlatformTools } from "./platform-tools.js";
@@ -7,6 +8,8 @@ import { z } from "zod";
 import fs from "fs";
 import path from "path";
 import os from "os";
+
+configureSystemCertificateTrust();
 
 interface TrelloConfig {
   apiKey: string;
@@ -194,7 +197,7 @@ async function fetchTrelloWithCreds<T>(
     url += `?key=${creds.apiKey}&token=${creds.token}`;
   }
   
-  const res = await fetch(url, {
+  const res = await requestTrello(url, {
     method,
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
@@ -216,7 +219,7 @@ async function fetchTrello<T>(
   const separator = endpoint.includes('?') ? '&' : '?';
   const url = `https://api.trello.com/1${endpoint}${separator}key=${cfg.apiKey}&token=${cfg.token}`;
   
-  const res = await fetch(url, {
+  const res = await requestTrello(url, {
     method,
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
@@ -1200,7 +1203,7 @@ server.tool(
       const oldDue = new Date(cardDetailsBefore.due).toLocaleString("pt-BR");
       
       const endpoint = `/cards/${targetCardId}?due=none`;
-      await fetch(`https://api.trello.com/1${endpoint}&key=${creds.apiKey}&token=${creds.token}`, { method: "PUT" });
+      await requestTrello(`https://api.trello.com/1${endpoint}&key=${creds.apiKey}&token=${creds.token}`, { method: "PUT" });
       
       const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
       
@@ -3597,7 +3600,7 @@ server.tool(
     try {
       const name = fileName || fileUrl.split("/").pop() || "arquivo";
       
-      const response = await fetch(
+      const response = await requestTrello(
         `https://api.trello.com/1/cards/${targetCardId}/attachments?key=${creds.apiKey}&token=${creds.token}`,
         {
           method: "POST",
