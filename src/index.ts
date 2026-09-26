@@ -667,7 +667,7 @@ server.tool(
       let text = `✅ **Card Criado**\n\n`;
       text += `📌 **${name}**\n`;
       text += `📋 Lista: ${destination.name}\n`;
-      if (desc) text += `📄 Descrição: ${desc.slice(0, 100)}${desc.length > 100 ? "..." : ""}\n`;
+      if (desc) text += `📄 Descrição completa:\n${desc}\n\n`;
       if (finalLabelIds.length > 0) text += `🏷️ Labels: ${finalLabelIds.length}\n`;
       if (due) text += `📅 Vencimento: ${due}\n`;
       text += `\n🔗 ${card.shortUrl}\n`;
@@ -927,7 +927,7 @@ server.tool(
 
 server.tool(
   "trello_get_card_details",
-  "Busca detalhes de um card do Trello",
+  "Busca detalhes de um card do Trello com a descrição completa, sem truncamento, preservando Markdown",
   {
     cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
@@ -966,7 +966,9 @@ server.tool(
       
       let output = `📌 **${cardDetails.name}**\n\n`;
       output += `🆔 ID: ${cardDetails.id}\n`;
-      if (cardDetails.desc) output += `📄 Descrição: ${cardDetails.desc.substring(0, 100)}...\n`;
+      output += cardDetails.desc
+        ? `📄 Descrição completa:\n${cardDetails.desc}\n\n`
+        : `📄 Descrição: (vazia)\n`;
       output += `🔗 ${cardDetails.shortUrl}\n`;
       
       if (cardDetails.labels && cardDetails.labels.length > 0) {

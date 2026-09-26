@@ -176,11 +176,15 @@ Isso irá mostrar todas as listas e seus IDs.
 | Função | Descrição |
 |--------|------------|
 | `trello_create_card` | Cria um novo card |
-| `trello_get_card_details` | Obtém detalhes de um card |
+| `trello_get_card_details` | Obtém detalhes e descrição completa do card, sem truncamento |
 | `trello_update_card` | Atualiza um card; movimentação exige listId ou listName exato |
 | `trello_move_card` | Move um card para a lista escolhida explicitamente |
 | `trello_mark_card_complete` | Conclui ou reabre um card, sem movimentação |
 | `trello_delete_card` | Exclui um card |
+
+Para ler a descrição de um card, use `trello_get_card_details` com `cardId` ou `cardName`. A resposta inclui todo o texto, preservando Markdown e quebras de linha; descrições vazias são identificadas explicitamente. Não é necessário abrir o navegador para obter o restante da descrição. A confirmação de `trello_create_card` também inclui a descrição integral.
+
+Após atualizar o código, execute `npm run build` e reinicie a conexão MCP no cliente para carregar a nova versão.
 
 ### Labels (Etiquetas)
 

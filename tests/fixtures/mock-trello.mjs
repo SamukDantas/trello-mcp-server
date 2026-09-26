@@ -13,7 +13,7 @@ const lists = [
 ];
 const otherLists = [{ id: '7'.repeat(24), name: 'Recepção' }];
 const cards = [
-  { id: card, name: 'Pedido 1', idBoard: board, idList: lists[0].id, idLabels: [], due: null, dueComplete: false, shortUrl: 'https://trello.com/c/fake' },
+  { id: card, desc: process.env.TRELLO_TEST_DESCRIPTION || '', name: 'Pedido 1', idBoard: board, idList: lists[0].id, idLabels: [], due: null, dueComplete: false, shortUrl: 'https://trello.com/c/fake' },
   { id: 'd'.repeat(24), name: 'Repetido', idBoard: board, idList: lists[3].id, idLabels: [] },
   { id: 'e'.repeat(24), name: 'Repetido', idBoard: board, idList: lists[3].id, idLabels: [] },
 ];
