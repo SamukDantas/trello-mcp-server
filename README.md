@@ -1,33 +1,21 @@
 # Trello MCP Server
 
-MCP (Model Context Protocol) para integração completa com o Trello. Gerencie quadros, listas, cards, labels, checklists, comentários, membros, anexos, webhooks e muito mais diretamente de assistentes de IA como o OpenCode CLI.
+Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io) para integração completa com o Trello. Gerencie quadros, listas, cards, labels, checklists, comentários, membros, anexos, campos personalizados, webhooks e automações diretamente de assistentes de IA: **Claude Code, Claude Desktop, OpenCode** ou qualquer cliente MCP via stdio.
+
+- **79 ferramentas**, cobrindo boards, listas, cards, labels, checklists, datas, membros, anexos, busca, votos, estatísticas, atividades, power-ups, webhooks, automação e campos personalizados
+- **96 testes automatizados** com clientes MCP em memória e via stdio, com respostas do Trello simuladas (sem credenciais nem quadros reais)
+- TypeScript estrito, SDK oficial do MCP e validação de parâmetros com Zod
 
 ## Índice
 
 1. [Instalação](#instalação)
 2. [Configuração](#configuração)
 3. [Obtendo Credenciais](#obtendo-credenciais-do-trello)
-4. [Uso com OpenCode CLI](#uso-com-opencode-cli)
+4. [Uso nos clientes MCP](#uso-nos-clientes-mcp)
 5. [Todas as Funções](#todas-as-funções)
-   - [Boards (Quadros)](#boards-quadros)
-   - [Listas](#listas)
-   - [Cards (Tarefas)](#cards-tarefas)
-   - [Labels (Etiquetas)](#labels-etiquetas)
-   - [Checklists](#checklists)
-   - [Comentários](#comentários)
-   - [Datas de Vencimento](#datas-de-vencimento)
-   - [Membros](#membros)
-   - [Arquivos e Anexos](#arquivos-e-anexos)
-   - [Busca](#busca)
-   - [Votações](#votações)
-   - [Estatísticas](#estatísticas)
-   - [Atividades](#atividades)
-   - [Power-Ups](#power-ups)
-   - [Webhooks](#webhooks)
-   - [Automação](#automação)
-   - [Export e Templates](#export-e-templates)
 6. [Exemplos de Uso](#exemplos-de-uso)
 7. [Solução de Problemas](#solução-de-problemas)
+8. [Desenvolvimento e validação](#desenvolvimento-e-validação)
 
 ---
 
@@ -35,46 +23,25 @@ MCP (Model Context Protocol) para integração completa com o Trello. Gerencie q
 
 ### Pré-requisitos
 
-- Node.js 18+ instalado
-- npm ou yarn
+- Node.js 18+ e npm
 - Conta no Trello
 
-### Passos de Instalação
+### Passos
 
-1. **Clone ou baixe o repositório**
+```bash
+git clone https://github.com/SamukDantas/trello-mcp-server.git
+cd trello-mcp-server
+npm install
+npm run build
+```
 
-   ```bash
-   cd ~/.config/opencode/mcp-servers
-   git clone https://github.com/seu-repo/trello-mcp.git
-   cd trello-mcp
-   ```
-
-2. **Instale as dependências**
-
-   ```bash
-   npm install
-   ```
-
-3. **Compile o TypeScript**
-
-   ```bash
-   npm run build
-   ```
-
-4. **Verifique a construção**
-
-   ```bash
-   ls dist/
-   # Você deve ver: index.js  index.d.ts  index.js.map
-   ```
+O build gera `dist/index.js`, que é o ponto de entrada do servidor.
 
 ---
 
 ## Configuração
 
-### Arquivo de Configuração
-
-Crie o arquivo de configuração em `~/.config/opencode/trello-config.json`:
+O servidor lê as credenciais de `~/.config/opencode/trello-config.json` (no Windows, `C:/Users/<você>/.config/opencode/trello-config.json`), qualquer que seja o cliente MCP:
 
 ```json
 {
@@ -88,23 +55,7 @@ As propriedades antigas `lists` e `labels` não são utilizadas. Nenhum nome de
 coluna, ordem de listas ou etiqueta determina o fluxo. O `boardId` define somente
 o quadro padrão; `boardUrl` e `trello_set_board` permitem escolher outro quadro.
 
-### Configuração no OpenCode
-
-Adicione ao seu arquivo `opencode.json`:
-
-```json
-{
-  "mcp": {
-    "trello": {
-      "type": "local",
-      "command": ["node", "C:/Users/SeuUsuario/.config/opencode/mcp-servers/trello/dist/index.js"],
-      "enabled": true
-    }
-  }
-}
-```
-
-> **Nota:** No Windows, use o caminho com barras normais.
+> Este arquivo contém credenciais: não o versione. O `.gitignore` do projeto já ignora `*-config.json`.
 
 ---
 
@@ -146,6 +97,51 @@ trello_list_lists
 ```
 
 Isso irá mostrar todas as listas e seus IDs.
+
+---
+
+## Uso nos clientes MCP
+
+Nos exemplos, troque `/caminho/para` pelo diretório onde você clonou o repositório. No Windows, use barras normais (`C:/Users/...`).
+
+### Claude Code
+
+```bash
+claude mcp add trello -- node /caminho/para/trello-mcp-server/dist/index.js
+```
+
+### Claude Desktop
+
+Em `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "trello": {
+      "command": "node",
+      "args": ["/caminho/para/trello-mcp-server/dist/index.js"]
+    }
+  }
+}
+```
+
+### OpenCode
+
+Em `opencode.json`:
+
+```json
+{
+  "mcp": {
+    "trello": {
+      "type": "local",
+      "command": ["node", "/caminho/para/trello-mcp-server/dist/index.js"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Depois de configurar, reinicie o cliente. Para validar as credenciais, peça ao assistente para executar `trello_list_boards`: se ele listar seus quadros, está tudo certo.
 
 ---
 
@@ -305,6 +301,57 @@ Após atualizar o código, execute `npm run build` e reinicie a conexão MCP no 
 | `trello_export_board` | Exporta quadro para JSON |
 | `trello_create_from_template` | Cria quadro a partir de template |
 
+### Recursos nativos adicionais
+
+As extensões abaixo usam a API REST oficial e ficam em `src/platform-tools.ts`.
+Foram priorizadas por cobrir lacunas do MCP: dados estruturados nos cards,
+recuperação de cards arquivados e acompanhamento individual.
+
+| Ferramenta | Uso |
+|-----------|-----|
+| `trello_list_custom_fields` | Lista campos do quadro com tipos e IDs das opções |
+| `trello_create_custom_field` | Cria campo text, number, date, checkbox ou list |
+| `trello_get_card_custom_fields` | Lê valores com nomes dos campos e opções |
+| `trello_set_card_custom_field` | Preenche ou limpa um campo do card |
+| `trello_list_archived_cards` | Lista cards arquivados com seus IDs |
+| `trello_set_card_archived` | Arquiva (`true`) ou restaura (`false`) um card |
+| `trello_set_card_subscription` | Acompanha ou deixa de acompanhar um card |
+
+As ferramentas de quadro aceitam `boardUrl` (URL, ID ou nome); quando omitido,
+usam o quadro ativo ou o padrão da configuração. As ferramentas de card exigem
+`cardId` de 24 caracteres, retornado pelas listagens, e operam diretamente nesse
+card, independentemente do quadro ativo. Não aceitam nomes parciais.
+
+Exemplos de chamadas MCP (nome da ferramenta seguido dos argumentos JSON):
+
+```text
+trello_create_custom_field {"name":"Prioridade","type":"list","options":["Alta","Média","Baixa"]}
+trello_list_custom_fields {}
+trello_set_card_custom_field {"cardId":"ID_DO_CARD","customFieldId":"ID_DO_CAMPO","value":"ID_DA_OPCAO"}
+trello_get_card_custom_fields {"cardId":"ID_DO_CARD"}
+trello_set_card_custom_field {"cardId":"ID_DO_CARD","customFieldId":"ID_DO_CAMPO","value":null}
+trello_list_archived_cards {}
+trello_set_card_archived {"cardId":"ID_DO_CARD","archived":false}
+trello_set_card_subscription {"cardId":"ID_DO_CARD","subscribed":true}
+```
+
+Substitua os IDs ilustrativos por IDs reais. Campos number recebem número JSON;
+checkbox recebe booleano; date recebe ISO 8601 com fuso (por exemplo,
+`2026-09-22T08:00:00-04:00`); list recebe o ID de uma opção existente.
+`null` limpa qualquer tipo de campo. A criação de campos list exige opções únicas;
+outros tipos não aceitam opções. O campo deve pertencer ao quadro do card.
+
+Campos personalizados dependem da disponibilidade do recurso e das permissões
+no quadro do Trello. As ferramentas retornam falhas com `isError: true`.
+Restaurar um card preserva sua lista original; se a lista estiver arquivada, ela
+precisa ser reaberta no Trello para voltar a aparecer no quadro. Acompanhar afeta
+somente o usuário autenticado e segue as regras de notificações do Trello.
+
+Referências oficiais:
+- [Campos personalizados](https://developer.atlassian.com/cloud/trello/guides/rest-api/getting-started-with-custom-fields/)
+- [API de campos personalizados](https://developer.atlassian.com/cloud/trello/rest/api-group-customfields/)
+- [API de cards](https://developer.atlassian.com/cloud/trello/rest/api-group-cards/)
+
 ---
 
 ## Exemplos de Uso
@@ -446,10 +493,10 @@ Falhas de rede agora informam o código da causa (por exemplo, `UNABLE_TO_VERIFY
 - Tente usar o parâmetro `cardId` em vez de `cardName`
 - Verifique se o card está no quadro correto
 
-### Funções não aparecem no OpenCode
+### Funções não aparecem no cliente MCP
 
-1. Reinicie o OpenCode CLI
-2. Verifique se o caminho no `opencode.json` está correto
+1. Reinicie o cliente MCP
+2. Verifique se o caminho para `dist/index.js` na configuração do cliente está correto
 3. Execute `npm run build` novamente
 
 ### Debugging
@@ -464,72 +511,7 @@ Se retornar uma lista de quadros, as credenciais estão corretas.
 
 ---
 
-## Licença
-
-MIT License - Copyright (c) 2026
-
----
-
-## Contribuição
-
-Sinta-se livre para contribuir com este projeto! Abra issues e mande pull requests.
-
----
-
-**Desenvolvido com amor para a comunidade OpenCode**
-
-## Recursos nativos adicionais
-
-As extensões abaixo usam a API REST oficial e ficam em `src/platform-tools.ts`.
-Foram priorizadas por cobrir lacunas do MCP: dados estruturados nos cards,
-recuperação de cards arquivados e acompanhamento individual.
-
-| Ferramenta | Uso |
-|-----------|-----|
-| `trello_list_custom_fields` | Lista campos do quadro com tipos e IDs das opções |
-| `trello_create_custom_field` | Cria campo text, number, date, checkbox ou list |
-| `trello_get_card_custom_fields` | Lê valores com nomes dos campos e opções |
-| `trello_set_card_custom_field` | Preenche ou limpa um campo do card |
-| `trello_list_archived_cards` | Lista cards arquivados com seus IDs |
-| `trello_set_card_archived` | Arquiva (`true`) ou restaura (`false`) um card |
-| `trello_set_card_subscription` | Acompanha ou deixa de acompanhar um card |
-
-As ferramentas de quadro aceitam `boardUrl` (URL, ID ou nome); quando omitido,
-usam o quadro ativo ou o padrão da configuração. As ferramentas de card exigem
-`cardId` de 24 caracteres, retornado pelas listagens, e operam diretamente nesse
-card, independentemente do quadro ativo. Não aceitam nomes parciais.
-
-Exemplos de chamadas MCP (nome da ferramenta seguido dos argumentos JSON):
-
-```text
-trello_create_custom_field {"name":"Prioridade","type":"list","options":["Alta","Média","Baixa"]}
-trello_list_custom_fields {}
-trello_set_card_custom_field {"cardId":"ID_DO_CARD","customFieldId":"ID_DO_CAMPO","value":"ID_DA_OPCAO"}
-trello_get_card_custom_fields {"cardId":"ID_DO_CARD"}
-trello_set_card_custom_field {"cardId":"ID_DO_CARD","customFieldId":"ID_DO_CAMPO","value":null}
-trello_list_archived_cards {}
-trello_set_card_archived {"cardId":"ID_DO_CARD","archived":false}
-trello_set_card_subscription {"cardId":"ID_DO_CARD","subscribed":true}
-```
-
-Substitua os IDs ilustrativos por IDs reais. Campos number recebem número JSON;
-checkbox recebe booleano; date recebe ISO 8601 com fuso (por exemplo,
-`2026-09-22T08:00:00-04:00`); list recebe o ID de uma opção existente.
-`null` limpa qualquer tipo de campo. A criação de campos list exige opções únicas;
-outros tipos não aceitam opções. O campo deve pertencer ao quadro do card.
-
-Campos personalizados dependem da disponibilidade do recurso e das permissões
-no quadro do Trello. As ferramentas retornam falhas com `isError: true`.
-Restaurar um card preserva sua lista original; se a lista estiver arquivada, ela
-precisa ser reaberta no Trello para voltar a aparecer no quadro. Acompanhar afeta
-somente o usuário autenticado e segue as regras de notificações do Trello.
-
-Referências oficiais:
-- [Campos personalizados](https://developer.atlassian.com/cloud/trello/guides/rest-api/getting-started-with-custom-fields/)
-- [API de campos personalizados](https://developer.atlassian.com/cloud/trello/rest/api-group-customfields/)
-- [API de cards](https://developer.atlassian.com/cloud/trello/rest/api-group-cards/)
-
-### Desenvolvimento e validação
+## Desenvolvimento e validação
 
 ```bash
 npm run build
@@ -538,4 +520,14 @@ npm test
 
 Os testes usam clientes MCP em memória e via stdio, com respostas Trello simuladas.
 Não precisam de credenciais nem acessam quadros reais. Após compilar, reinicie o
-cliente MCP para carregar as novas ferramentas. O servidor passa a expor 79 ferramentas.
+cliente MCP para carregar as novas ferramentas. O servidor expõe 79 ferramentas.
+
+---
+
+## Licença
+
+[MIT](LICENSE) © 2026 Samuel Dantas
+
+## Contribuição
+
+Issues e pull requests são bem-vindos.
