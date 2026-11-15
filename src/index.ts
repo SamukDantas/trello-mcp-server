@@ -14,7 +14,7 @@ configureSystemCertificateTrust();
 interface TrelloConfig {
   apiKey: string;
   token: string;
-  boardId: string;
+  boardId?: string;
 }
 
 interface TrelloBoard {
@@ -33,6 +33,8 @@ interface TrelloCard {
   idLabels: string[];
   idBoard: string;
   due?: string | null;
+  dueComplete?: boolean;
+  desc?: string;
 }
 
 interface TrelloList {
@@ -120,12 +122,6 @@ interface TrelloComment {
   };
 }
 
-interface TrelloPowerUp {
-  id: string;
-  name: string;
-  description: string;
-}
-
 interface TrelloWebhook {
   id: string;
   description: string;
@@ -151,36 +147,58 @@ interface TrelloAction {
 }
 
 let currentBoardId: string | null = null;
+// shortLink -> ID de 24 caracteres. O vínculo é imutável no Trello, então pode ser reaproveitado.
+const boardIdByShortLink = new Map<string, string>();
 
 interface TrelloCredentials {
   apiKey: string;
   token: string;
 }
 
+const OBJECT_ID = /^[a-f0-9]{24}$/i;
+// IDs e shortLinks do Trello são alfanuméricos. Rejeitar o resto impede que um ID
+// malformado ("../boards/x", "abc?closed=true") aponte para outro recurso ou injete parâmetros.
+const trelloId = z.string().trim().regex(/^[A-Za-z0-9]{1,64}$/, "ID do Trello inválido: use apenas letras e números");
+const SAFE_PATH = /^(\/[A-Za-z0-9_-]+)+$/;
+const credential = z.string().trim().regex(/^[^\s"\\]+$/, "valor inválido");
+const configSchema = z.object({
+  apiKey: credential,
+  token: credential,
+  boardId: trelloId.optional(),
+});
+
 function loadConfig(): TrelloConfig {
   const configPath = path.join(os.homedir(), ".config", "opencode", "trello-config.json");
-  
-  if (!fs.existsSync(configPath)) {
+
+  const apiKey = process.env.TRELLO_API_KEY;
+  const token = process.env.TRELLO_TOKEN;
+
+  let fromFile: unknown = {};
+  if (fs.existsSync(configPath)) {
+    try {
+      fromFile = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    } catch {
+      throw new Error(`Configuração inválida: ${configPath} não contém JSON válido`);
+    }
+  } else if (!apiKey || !token) {
     throw new Error(`Config file not found: ${configPath}`);
   }
-  
-  return JSON.parse(fs.readFileSync(configPath, "utf-8"));
+
+  // Variáveis de ambiente têm precedência: assim as credenciais não precisam ficar em disco.
+  const parsed = configSchema.safeParse({
+    ...(fromFile as object),
+    ...(apiKey ? { apiKey } : {}),
+    ...(token ? { token } : {}),
+  });
+  if (!parsed.success) {
+    throw new Error(`Configuração inválida: defina TRELLO_API_KEY e TRELLO_TOKEN no ambiente, ou apiKey e token (textos sem espaços) em ${configPath}`);
+  }
+  return parsed.data;
 }
 
 function getCredentials(): TrelloCredentials {
   const cfg = loadConfig();
   return { apiKey: cfg.apiKey, token: cfg.token };
-}
-
-function extractBoardId(input: string): string | null {
-  if (/^[a-f0-9]{24}$/i.test(input)) {
-    return input;
-  }
-  const urlMatch = input.match(/trello\.com\/b\/([a-zA-Z0-9]+)/);
-  if (urlMatch) {
-    return urlMatch[1];
-  }
-  return null;
 }
 
 async function fetchTrelloWithCreds<T>(
@@ -189,133 +207,123 @@ async function fetchTrelloWithCreds<T>(
   method: "GET" | "POST" | "PUT" | "DELETE" = "GET",
   body?: object
 ): Promise<T> {
-  // Se j\u00e1 tem query string, n\u00e3o adicionar ?
-  let url = `https://api.trello.com/1${endpoint}`;
-  if (endpoint.includes('?')) {
-    url += `&key=${creds.apiKey}&token=${creds.token}`;
-  } else {
-    url += `?key=${creds.apiKey}&token=${creds.token}`;
+  const [pathname] = endpoint.split("?");
+  if (!SAFE_PATH.test(pathname)) {
+    throw new Error("Identificador inválido na requisição ao Trello: use os IDs retornados pelas listagens");
   }
-  
-  const res = await requestTrello(url, {
+
+  // Credenciais vão no cabeçalho, nunca na URL: URLs acabam em logs de proxy e mensagens de erro.
+  const res = await requestTrello(`https://api.trello.com/1${endpoint}`, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers: {
+      Authorization: `OAuth oauth_consumer_key="${creds.apiKey}", oauth_token="${creds.token}"`,
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
-  
+
   if (!res.ok) {
-    throw new Error(`Trello API error: ${res.status} ${res.statusText}`);
+    const detail = (await res.text().catch(() => ""))
+      .split(creds.token).join("***")
+      .split(creds.apiKey).join("***")
+      .trim()
+      .slice(0, 300);
+    throw new Error(`Trello API error: ${res.status} ${res.statusText}${detail ? ` - ${detail}` : ""}`);
   }
-  
+
   return res.json();
 }
 
-async function fetchTrello<T>(
-  cfg: TrelloConfig,
-  endpoint: string,
-  method: "GET" | "POST" | "PUT" | "DELETE" = "GET",
-  body?: object
-): Promise<T> {
-  const separator = endpoint.includes('?') ? '&' : '?';
-  const url = `https://api.trello.com/1${endpoint}${separator}key=${cfg.apiKey}&token=${cfg.token}`;
-  
-  const res = await requestTrello(url, {
-    method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  
-  if (!res.ok) {
-    throw new Error(`Trello API error: ${res.status} ${res.statusText}`);
-  }
-  
-  return res.json();
+/**
+ * Seleciona um item pelo nome sem escolher arbitrariamente: nome exato primeiro,
+ * depois trecho do nome somente se identificar um único item.
+ */
+function pickByName<T extends { id: string; name: string }>(items: T[], name: string, kind: string, exactOnly = false): T {
+  const wanted = name.trim().toLowerCase();
+  const describe = (matches: T[]) => matches.slice(0, 5).map(item => `"${item.name}" (${item.id})`).join("; ");
+  const exact = items.filter(item => item.name.trim().toLowerCase() === wanted);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) throw new Error(`Nome de ${kind} ambíguo: "${name}" corresponde a ${exact.length} itens: ${describe(exact)}. Informe o ID`);
+  if (exactOnly) throw new Error(`${kind} não encontrado com o nome exato "${name}". Informe o nome completo ou o ID`);
+  const partial = wanted ? items.filter(item => item.name.toLowerCase().includes(wanted)) : [];
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) throw new Error(`Nome de ${kind} ambíguo: "${name}" corresponde a ${partial.length} itens: ${describe(partial)}. Informe o ID`);
+  throw new Error(`${kind} não encontrado: "${name}"`);
 }
 
 async function resolveBoardId(input: string | undefined, creds: TrelloCredentials): Promise<string> {
-  if (!input) {
-    const cfg = loadConfig();
-    const boardId = currentBoardId || cfg.boardId;
-    
-    // Se o boardId não é um ObjectId de 24 caracteres, tentar resolver
-    if (!/^[a-f0-9]{24}$/i.test(boardId)) {
-      const boards = await fetchTrelloWithCreds<TrelloBoard[]>(creds, "/members/me/boards");
-      const board = boards.find(b => b.shortUrl.includes(boardId) || b.name.toLowerCase().includes(boardId.toLowerCase()));
-      if (board) return board.id;
-    }
-    
-    return boardId;
+  const value = (input ?? currentBoardId ?? loadConfig().boardId ?? "").trim();
+  if (!value) {
+    throw new Error("Nenhum quadro definido: informe boardUrl, use trello_set_board ou configure boardId");
   }
-  
-  const extracted = extractBoardId(input);
-  if (extracted) {
-    if (/^[a-f0-9]{24}$/i.test(extracted)) {
-      return extracted;
+  if (OBJECT_ID.test(value)) return value;
+
+  const fromUrl = value.match(/trello\.com\/b\/([A-Za-z0-9]+)/)?.[1];
+  const shortLink = fromUrl ?? (/^[A-Za-z0-9]{8}$/.test(value) ? value : undefined);
+  if (shortLink) {
+    const cached = boardIdByShortLink.get(shortLink);
+    if (cached) return cached;
+    try {
+      const board = await fetchTrelloWithCreds<{ id: string }>(creds, `/boards/${shortLink}?fields=id`);
+      boardIdByShortLink.set(shortLink, board.id);
+      return board.id;
+    } catch (error) {
+      // Uma palavra de 8 letras também pode ser o nome de um quadro; só a URL é conclusiva.
+      if (fromUrl) throw new Error(`Board não encontrado: ${value}`);
     }
-    const boards = await fetchTrelloWithCreds<TrelloBoard[]>(creds, "/members/me/boards");
-    const board = boards.find(b => b.shortUrl.includes(extracted) || b.id === extracted);
-    if (board) return board.id;
   }
-  
+
   const boards = await fetchTrelloWithCreds<TrelloBoard[]>(creds, "/members/me/boards");
-  const board = boards.find(b => b.name.toLowerCase().includes(input.toLowerCase()));
-  if (board) return board.id;
-  
-  throw new Error(`Board não encontrado: ${input}`);
+  return pickByName(boards, value, "Quadro").id;
+}
+
+async function resolveCardId(
+  creds: TrelloCredentials,
+  boardId: string,
+  cardId: string | undefined,
+  cardName: string | undefined,
+  exactOnly = false
+): Promise<string> {
+  if (cardId) return cardId;
+  if (!cardName?.trim()) throw new Error("Forneça cardId ou cardName");
+  const cards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
+  return pickByName(cards, cardName, "Card", exactOnly).id;
 }
 
 async function getBoardLists(creds: TrelloCredentials, boardId: string): Promise<TrelloList[]> {
   return fetchTrelloWithCreds<TrelloList[]>(creds, `/boards/${boardId}/lists`);
 }
 
-async function getAllCards(cfg: TrelloConfig): Promise<TrelloCard[]> {
-  return fetchTrello<TrelloCard[]>(cfg, `/boards/${cfg.boardId}/cards/open`);
+/** Nomes de etiqueta viram IDs por nome exato; inexistente ou repetido é erro, nunca aproximação. */
+function labelIdsByName(labels: TrelloBoardLabel[], names: string[]): string[] {
+  return names.map(name => pickByName(labels, name, "Label", true).id);
 }
 
-async function getLists(cfg: TrelloConfig): Promise<TrelloList[]> {
-  return fetchTrello<TrelloList[]>(cfg, `/boards/${cfg.boardId}/lists`);
+interface BoardPrefsInput {
+  visibility?: "private" | "team" | "public";
+  votingEnabled?: boolean;
+  commentsEnabled?: boolean;
+  invitationsEnabled?: boolean;
+  selfJoinEnabled?: boolean;
 }
 
-async function getCardDetails(cfg: TrelloConfig, cardId: string): Promise<TrelloCardDetails> {
-  return fetchTrello<TrelloCardDetails>(cfg, `/cards/${cardId}`);
-}
-
-async function getCardChecklists(cfg: TrelloConfig, cardId: string): Promise<TrelloChecklist[]> {
-  return fetchTrello<TrelloChecklist[]>(cfg, `/cards/${cardId}/checklists`);
-}
-
-async function getCardComments(cfg: TrelloConfig, cardId: string): Promise<TrelloComment[]> {
-  return fetchTrello<TrelloComment[]>(cfg, `/cards/${cardId}/actions?filter=commentCard`);
-}
-
-async function getCardAttachments(cfg: TrelloConfig, cardId: string): Promise<TrelloAttachment[]> {
-  return fetchTrello<TrelloAttachment[]>(cfg, `/cards/${cardId}/attachments`);
-}
-
-async function getBoardLabels(cfg: TrelloConfig): Promise<TrelloBoardLabel[]> {
-  return fetchTrello<TrelloBoardLabel[]>(cfg, `/boards/${cfg.boardId}/labels`);
-}
-
-async function getMembers(cfg: TrelloConfig, memberIds: string[]): Promise<TrelloMember[]> {
-  const members: TrelloMember[] = [];
-  for (const id of memberIds) {
-    try {
-      const member = await fetchTrello<TrelloMember>(cfg, `/members/${id}`);
-      members.push(member);
-    } catch {
-      // Skip if member not found
-    }
-  }
-  return members;
-}
-
-async function findCardByName(cfg: TrelloConfig, name: string): Promise<TrelloCard | null> {
-  const cards = await getAllCards(cfg);
-  const searchName = name.toLowerCase().trim();
-  return cards.find(c => 
-    c.name.toLowerCase().includes(searchName) || 
-    searchName.includes(c.name.toLowerCase())
-  ) || null;
+/**
+ * Traduz as preferências da ferramenta para os parâmetros da API do Trello, que são
+ * prefs_<nome> na criação e prefs/<nome> na atualização, com valores próprios (ex.: team -> org).
+ */
+function boardPrefsQuery(prefs: BoardPrefsInput | undefined, separator: "_" | "/"): string {
+  if (!prefs) return "";
+  const params = new URLSearchParams();
+  const set = (key: string, value: string | undefined) => {
+    if (value !== undefined) params.set(`prefs${separator}${key}`, value);
+  };
+  const toggle = (flag: boolean | undefined, on: string, off: string) => flag === undefined ? undefined : flag ? on : off;
+  set("permissionLevel", prefs.visibility && { private: "private", team: "org", public: "public" }[prefs.visibility]);
+  set("voting", toggle(prefs.votingEnabled, "members", "disabled"));
+  set("comments", toggle(prefs.commentsEnabled, "members", "disabled"));
+  set("invitations", toggle(prefs.invitationsEnabled, "members", "admins"));
+  set("selfJoin", toggle(prefs.selfJoinEnabled, "true", "false"));
+  return params.toString();
 }
 
 const server = new McpServer({
@@ -342,7 +350,7 @@ server.tool(
     for (const board of openBoards) {
       const active = currentBoardId === board.id ? " ⭐ (ativo)" : "";
       text += `• ${board.name}${active}\n`;
-      text += `  🔗 ${board.shortUrl}\n\n`;
+      text += `  🆔 ${board.id}\n  🔗 ${board.shortUrl}\n\n`;
     }
     
     return { content: [{ type: "text", text }] };
@@ -398,15 +406,8 @@ server.tool(
         boardData.desc = description;
       }
       
-      if (prefs) {
-        if (prefs.visibility) boardData.prefs = { visibility: prefs.visibility };
-        if (prefs.votingEnabled !== undefined) (boardData.prefs as Record<string, unknown>).votingEnabled = prefs.votingEnabled;
-        if (prefs.commentsEnabled !== undefined) (boardData.prefs as Record<string, unknown>).commentsEnabled = prefs.commentsEnabled;
-        if (prefs.invitationsEnabled !== undefined) (boardData.prefs as Record<string, unknown>).invitationsEnabled = prefs.invitationsEnabled;
-        if (prefs.selfJoinEnabled !== undefined) (boardData.prefs as Record<string, unknown>).selfJoinEnabled = prefs.selfJoinEnabled;
-      }
-      
-      const newBoard = await fetchTrelloWithCreds<TrelloBoard>(creds, "/boards", "POST", boardData);
+      const prefsQuery = boardPrefsQuery(prefs, "_");
+      const newBoard = await fetchTrelloWithCreds<TrelloBoard>(creds, `/boards${prefsQuery ? `?${prefsQuery}` : ""}`, "POST", boardData);
       
       let text = `✅ **Quadro Criado**\n\n`;
       text += `📋 **${newBoard.name}**\n`;
@@ -417,6 +418,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao criar quadro: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -430,7 +432,7 @@ server.tool(
   "trello_update_board",
   "Atualiza um quadro existente do Trello",
   {
-    boardId: z.string().optional().describe("ID do quadro (alternativa ao nome)"),
+    boardId: trelloId.optional().describe("ID do quadro (alternativa ao nome)"),
     boardName: z.string().optional().describe("Nome ou parte do nome do quadro (alternativa ao ID)"),
     newName: z.string().optional().describe("Novo nome do quadro"),
     newDescription: z.string().optional().describe("Nova descrição"),
@@ -450,26 +452,13 @@ server.tool(
     
     if (!targetBoardId && boardName) {
       const boards = await fetchTrelloWithCreds<TrelloBoard[]>(creds, "/members/me/boards");
-      const searchName = boardName.toLowerCase().trim();
-      const foundBoard = boards.find(b => 
-        b.name.toLowerCase().includes(searchName) || 
-        searchName.includes(b.name.toLowerCase())
-      );
-      
-      if (!foundBoard) {
-        const availableBoards = boards.map(b => b.name).join(", ");
-        return {
-          content: [{ 
-            type: "text", 
-            text: `❌ Quadro "${boardName}" não encontrado.\n\nQuadros disponíveis:\n${availableBoards}` 
-          }],
-        };
-      }
+      const foundBoard = pickByName(boards, boardName, "Quadro");
       targetBoardId = foundBoard.id;
     }
     
     if (!targetBoardId) {
       return {
+        isError: true,
         content: [{ type: "text", text: "❌ Forneça boardId ou boardName" }],
       };
     }
@@ -480,27 +469,20 @@ server.tool(
     if (newDescription !== undefined) updateData.desc = newDescription;
     if (closed !== undefined) updateData.closed = closed;
     
-    if (prefs) {
-      const prefsData: Record<string, unknown> = {};
-      if (prefs.visibility) prefsData.visibility = prefs.visibility;
-      if (prefs.votingEnabled !== undefined) prefsData.votingEnabled = prefs.votingEnabled;
-      if (prefs.commentsEnabled !== undefined) prefsData.commentsEnabled = prefs.commentsEnabled;
-      if (prefs.invitationsEnabled !== undefined) prefsData.invitationsEnabled = prefs.invitationsEnabled;
-      if (prefs.selfJoinEnabled !== undefined) prefsData.selfJoinEnabled = prefs.selfJoinEnabled;
-      if (Object.keys(prefsData).length > 0) updateData.prefs = prefsData;
-    }
+    const prefsQuery = boardPrefsQuery(prefs, "/");
     
-    if (Object.keys(updateData).length === 0) {
+    if (Object.keys(updateData).length === 0 && !prefsQuery) {
       return {
-        content: [{ 
-          type: "text", 
-          text: "❌ Forneça pelo menos um campo para atualizar: newName, newDescription, closed, ou prefs" 
+        isError: true,
+        content: [{
+          type: "text",
+          text: "❌ Forneça pelo menos um campo para atualizar: newName, newDescription, closed, ou prefs"
         }],
       };
     }
     
     try {
-      const updatedBoard = await fetchTrelloWithCreds<TrelloBoard>(creds, `/boards/${targetBoardId}`, "PUT", updateData);
+      const updatedBoard = await fetchTrelloWithCreds<TrelloBoard>(creds, `/boards/${targetBoardId}${prefsQuery ? `?${prefsQuery}` : ""}`, "PUT", updateData);
       
       let text = `✅ **Quadro Atualizado**\n\n`;
       text += `📋 **${updatedBoard.name}**\n`;
@@ -514,6 +496,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao atualizar quadro: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -527,11 +510,19 @@ server.tool(
   "trello_delete_board",
   "Exclui (arquiva) um quadro do Trello",
   {
-    boardId: z.string().optional().describe("ID do quadro (alternativa ao nome)"),
+    boardId: trelloId.optional().describe("ID do quadro (alternativa ao nome)"),
     boardName: z.string().optional().describe("Nome ou parte do nome do quadro (alternativa ao ID)"),
-    permanent: z.boolean().optional().describe("Excluir permanentemente (requer confirmação). Use com cuidado!")
+    permanent: z.boolean().optional().describe("Excluir permanentemente em vez de arquivar. Exige confirm: true e, se usar boardName, o nome exato"),
+    confirm: z.boolean().optional().describe("Obrigatório (true) para a exclusão permanente, que não pode ser desfeita")
   },
-  async ({ boardId, boardName, permanent }) => {
+  async ({ boardId, boardName, permanent, confirm }) => {
+    if (permanent && confirm !== true) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "⚠️ Exclusão permanente não executada. Ela não pode ser desfeita: repita com confirm: true, ou omita permanent para apenas arquivar o quadro." }],
+      };
+    }
+
     const creds = getCredentials();
     
     let targetBoardId = boardId;
@@ -539,27 +530,14 @@ server.tool(
     
     if (!targetBoardId && boardName) {
       const boards = await fetchTrelloWithCreds<TrelloBoard[]>(creds, "/members/me/boards");
-      const searchName = boardName.toLowerCase().trim();
-      const foundBoard = boards.find(b => 
-        b.name.toLowerCase().includes(searchName) || 
-        searchName.includes(b.name.toLowerCase())
-      );
-      
-      if (!foundBoard) {
-        const availableBoards = boards.map(b => b.name).join(", ");
-        return {
-          content: [{ 
-            type: "text", 
-            text: `❌ Quadro "${boardName}" não encontrado.\n\nQuadros disponíveis:\n${availableBoards}` 
-          }],
-        };
-      }
+      const foundBoard = pickByName(boards, boardName, "Quadro", permanent === true);
       targetBoardId = foundBoard.id;
       boardNameDeleted = foundBoard.name;
     }
     
     if (!targetBoardId) {
       return {
+        isError: true,
         content: [{ type: "text", text: "❌ Forneça boardId ou boardName" }],
       };
     }
@@ -585,6 +563,7 @@ server.tool(
       }
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao excluir quadro: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -601,37 +580,29 @@ server.tool(
   "Cria um card completo com lista, labels e descrição personalizáveis",
   {
     name: z.string().describe("Título do card"),
-    listId: z.string().trim().min(1).optional().describe("ID da lista escolhida"),
+    listId: trelloId.optional().describe("ID da lista escolhida"),
     listName: z.string().trim().min(1).optional().describe("Nome exato da lista; use listId se houver nomes repetidos"),
-    labelIds: z.array(z.string()).optional().describe("IDs das labels a adicionar"),
+    labelIds: z.array(trelloId).optional().describe("IDs das labels a adicionar"),
     labelNames: z.array(z.string()).optional().describe("Nomes das labels (alternativa aos IDs)"),
     desc: z.string().optional().describe("Descrição do card (suporta Markdown)"),
     due: z.string().optional().describe("Data de vencimento (ISO format ou relativo como 'tomorrow')"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ name, listId, listName, labelIds, labelNames, desc, due, boardUrl }) => {
-    const cfg = loadConfig();
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
     const destination = selectList(await getBoardLists(creds, boardId), listId, listName);
     const targetListId = destination.id;
 
-    let finalLabelIds = labelIds || [];
-    
+    const finalLabelIds = [...(labelIds ?? [])];
     if (labelNames && labelNames.length > 0) {
       const boardLabels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
-      for (const labelName of labelNames) {
-        const found = boardLabels.find(l => 
-          l.name.toLowerCase() === labelName.toLowerCase() ||
-          l.name.toLowerCase().includes(labelName.toLowerCase())
-        );
-        if (found && !finalLabelIds.includes(found.id)) {
-          finalLabelIds.push(found.id);
-        }
+      for (const id of labelIdsByName(boardLabels, labelNames)) {
+        if (!finalLabelIds.includes(id)) finalLabelIds.push(id);
       }
     }
-    
+
     const cardData: Record<string, unknown> = {
       idList: targetListId,
       name: name,
@@ -679,6 +650,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao criar card: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -692,7 +664,7 @@ server.tool(
   "trello_add_comment",
   "Adiciona um comentário a um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     text: z.string().describe("Texto do comentário"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
@@ -701,29 +673,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/actions/comments`, "POST", { text });
@@ -739,6 +689,7 @@ server.tool(
       return { content: [{ type: "text", text: textOutput }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao adicionar comentário: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -752,17 +703,17 @@ server.tool(
   "trello_update_card",
   "Atualiza um card existente (move de lista, atualiza nome, descrição, etiquetas, etc)",
   {
-    cardId: z.string().optional().describe("ID do card a atualizar"),
+    cardId: trelloId.optional().describe("ID do card a atualizar"),
     cardName: z.string().optional().describe("Nome exato do card (alternativa ao ID)"),
-    listId: z.string().trim().min(1).optional().describe("ID da lista escolhida"),
+    listId: trelloId.optional().describe("ID da lista escolhida"),
     listName: z.string().trim().min(1).optional().describe("Nome exato da lista; use listId se houver nomes repetidos"),
     name: z.string().optional().describe("Novo título do card"),
     desc: z.string().optional().describe("Nova descrição"),
-    labelIds: z.array(z.string()).optional().describe("Array de IDs de labels para SUBSTITUIR todas as labels existentes"),
+    labelIds: z.array(trelloId).optional().describe("Array de IDs de labels para SUBSTITUIR todas as labels existentes"),
     labelNames: z.array(z.string()).optional().describe("Array de nomes de labels para SUBSTITUIR todas as labels existentes"),
-    addLabelIds: z.array(z.string()).optional().describe("Array de IDs de labels para ADICIONAR às existentes (não remove outras)"),
+    addLabelIds: z.array(trelloId).optional().describe("Array de IDs de labels para ADICIONAR às existentes (não remove outras)"),
     addLabelNames: z.array(z.string()).optional().describe("Array de nomes de labels para ADICIONAR às existentes (não remove outras)"),
-    removeLabelIds: z.array(z.string()).optional().describe("Array de IDs de labels para REMOVER"),
+    removeLabelIds: z.array(trelloId).optional().describe("Array de IDs de labels para REMOVER"),
     removeLabelNames: z.array(z.string()).optional().describe("Array de nomes de labels para REMOVER"),
     due: z.string().optional().describe("Data de vencimento (ISO 8601, 'today', 'tomorrow', 'next week', ou 'remove' para remover"),
     dueComplete: z.boolean().optional().describe("Marcar o card como concluído, mesmo sem vencimento"),
@@ -772,28 +723,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const matches = allCards.filter(c => c.name.trim().toLowerCase() === searchName);
-      if (matches.length > 1) throw new Error("Nome de card ambíguo; informe cardId");
-      const card = matches[0];
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName, true);
     
     // Buscar labels atuais do card (sem limitar campos para garantir que idLabels seja retornado)
     const currentCard = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=idLabels,idBoard`);
@@ -805,61 +735,29 @@ server.tool(
     if (name) updateData.name = name;
     if (desc !== undefined) updateData.desc = desc;
     
-    // Handle labels - modo substituição (comportamento original)
-    if (labelIds && labelIds.length > 0) {
-      updateData.idLabels = labelIds.join(",");
-      labelChanges.push(`Labels substituídas: ${labelIds.length}`);
-    } else if (labelNames && labelNames.length > 0) {
-      const boardLabels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
-      const labelIdsFromNames = boardLabels
-        .filter(l => labelNames.some(name => l.name.toLowerCase().includes(name.toLowerCase())))
-        .map(l => l.id);
-      updateData.idLabels = labelIdsFromNames.join(",");
-      labelChanges.push(`Labels substituídas por nomes: ${labelNames.join(", ")}`);
+    // Etiquetas: a substituição define a base; depois somam-se as adições e retiram-se as remoções.
+    // Assim, combinar os modos na mesma chamada não descarta nenhum deles.
+    const requestedNames = [...(labelNames ?? []), ...(addLabelNames ?? []), ...(removeLabelNames ?? [])];
+    const boardLabels = requestedNames.length > 0
+      ? await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`)
+      : [];
+    const replaceIds = [...(labelIds ?? []), ...labelIdsByName(boardLabels, labelNames ?? [])];
+    const addIds = [...(addLabelIds ?? []), ...labelIdsByName(boardLabels, addLabelNames ?? [])];
+    const removeIds = [...(removeLabelIds ?? []), ...labelIdsByName(boardLabels, removeLabelNames ?? [])];
+    if (replaceIds.length > 0 || addIds.length > 0 || removeIds.length > 0) {
+      const base = replaceIds.length > 0 ? replaceIds : currentLabelIds;
+      const finalIds = [...new Set([...base, ...addIds])].filter(id => !removeIds.includes(id));
+      updateData.idLabels = finalIds.join(",");
+      if (replaceIds.length > 0) labelChanges.push(`Labels substituídas: ${replaceIds.length}`);
+      if (addIds.length > 0) labelChanges.push(`Labels adicionadas: ${addIds.filter(id => !base.includes(id)).length}`);
+      if (removeIds.length > 0) labelChanges.push(`Labels removidas: ${removeIds.filter(id => base.includes(id) || addIds.includes(id)).length}`);
     }
-    
-    // Handle labels - modo adicionar (não remove existentes)
-    let finalAddLabelIds: string[] = [];
-    if (addLabelIds && addLabelIds.length > 0) {
-      finalAddLabelIds = addLabelIds.filter(id => !currentLabelIds.includes(id));
-    }
-    if (addLabelNames && addLabelNames.length > 0) {
-      const boardLabels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
-      const labelIdsFromNames = boardLabels
-        .filter(l => addLabelNames.some(name => l.name.toLowerCase().includes(name.toLowerCase())))
-        .map(l => l.id);
-      finalAddLabelIds = [...finalAddLabelIds, ...labelIdsFromNames.filter(id => !currentLabelIds.includes(id))];
-    }
-    if (finalAddLabelIds.length > 0) {
-      const newLabelIds = [...currentLabelIds, ...finalAddLabelIds];
-      updateData.idLabels = newLabelIds.join(",");
-      labelChanges.push(`Labels adicionadas: ${finalAddLabelIds.length}`);
-    }
-    
-    // Handle labels - modo remover
-    let finalRemoveLabelIds: string[] = [];
-    if (removeLabelIds && removeLabelIds.length > 0) {
-      finalRemoveLabelIds = removeLabelIds;
-    }
-    if (removeLabelNames && removeLabelNames.length > 0) {
-      const boardLabels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
-      const labelIdsFromNames = boardLabels
-        .filter(l => removeLabelNames.some(name => l.name.toLowerCase().includes(name.toLowerCase())))
-        .map(l => l.id);
-      finalRemoveLabelIds = [...finalRemoveLabelIds, ...labelIdsFromNames];
-    }
-    if (finalRemoveLabelIds.length > 0) {
-      const remainingLabelIds = currentLabelIds.filter(id => !finalRemoveLabelIds.includes(id));
-      updateData.idLabels = remainingLabelIds.join(",");
-      labelChanges.push(`Labels removidas: ${finalRemoveLabelIds.length}`);
-    }
-    
+
     // Handle due date
     if (due !== undefined) {
       if (due === "remove" || due === "") {
-        // stdout é reservado ao protocolo MCP.
-        // Enviar "none" para remover a data
-        updateData.due = null;
+        // A API ignora due: null em JSON; a string vazia é o que de fato remove a data.
+        updateData.due = "";
         labelChanges.push("Data de vencimento removida");
       } else if (due === "today") {
         updateData.due = new Date().toISOString();
@@ -893,6 +791,7 @@ server.tool(
 
     if (Object.keys(updateData).length === 0) {
       return {
+        isError: true,
         content: [{ 
           type: "text", 
           text: `❌ Nenhum campo para atualizar. Forneça pelo menos um campo (name, desc, listId, listName, labelIds, addLabelIds, addLabelNames, removeLabelIds, removeLabelNames, due, dueComplete). Ex: due: "remove" para remover data`
@@ -919,6 +818,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao atualizar card: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -932,7 +832,7 @@ server.tool(
   "trello_get_card_details",
   "Busca detalhes de um card do Trello com a descrição completa, sem truncamento, preservando Markdown",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -940,29 +840,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=all&actions=all&board=true&lists=all&labels=all&checklists=all`);
@@ -989,6 +867,7 @@ server.tool(
       return { content: [{ type: "text", text: output }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao buscar card: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1002,7 +881,7 @@ server.tool(
   "trello_set_due_date",
   "Define uma data de vencimento em um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     due: z.string().describe("Data de vencimento: ISO 8601, 'today', 'tomorrow', 'next week', ou data específica"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
@@ -1011,29 +890,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       let dueDate: string;
@@ -1054,7 +911,7 @@ server.tool(
       
       await fetchTrelloWithCreds(creds, `/cards/${targetCardId}`, "PUT", { due: dueDate });
       
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,due`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,due,shortUrl`);
       
       const formattedDue = new Date(dueDate).toLocaleString("pt-BR");
       
@@ -1066,6 +923,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao definir data: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1079,7 +937,7 @@ server.tool(
   "trello_get_due_date",
   "Busca a data de vencimento de um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -1087,32 +945,10 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,due,dueComplete`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,due,dueComplete,shortUrl`);
       
       let text = `📅 **Data de Vencimento**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
@@ -1143,6 +979,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao buscar data: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1156,7 +993,7 @@ server.tool(
   "trello_remove_due_date",
   "Remove a data de vencimento de um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -1164,32 +1001,10 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
-      const cardDetailsBefore = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,due`);
+      const cardDetailsBefore = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,due,shortUrl`);
       
       if (!cardDetailsBefore.due) {
         return {
@@ -1202,10 +1017,10 @@ server.tool(
       
       const oldDue = new Date(cardDetailsBefore.due).toLocaleString("pt-BR");
       
-      const endpoint = `/cards/${targetCardId}?due=none`;
-      await requestTrello(`https://api.trello.com/1${endpoint}&key=${creds.apiKey}&token=${creds.token}`, { method: "PUT" });
+      // A API ignora due: null em JSON; a string vazia é o que de fato remove a data.
+      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}`, "PUT", { due: "" });
       
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       let text = `✅ **Data de Vencimento Removida**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
@@ -1215,6 +1030,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao remover data: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1228,7 +1044,7 @@ server.tool(
   "trello_mark_due_complete",
   "Marca um card como concluído ou pendente, mesmo sem vencimento; não move de lista",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     complete: z.boolean().describe("true = concluída, false = pendente"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
@@ -1237,29 +1053,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       await fetchTrelloWithCreds(creds, `/cards/${targetCardId}`, "PUT", { dueComplete: complete });
@@ -1277,6 +1071,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao atualizar status: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1290,7 +1085,7 @@ server.tool(
   "trello_get_comments",
   "Busca comentários de um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -1298,29 +1093,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       const comments = await fetchTrelloWithCreds<TrelloComment[]>(creds, `/cards/${targetCardId}/actions?filter=commentCard`);
@@ -1348,6 +1121,7 @@ server.tool(
       return { content: [{ type: "text", text: output }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao buscar comentários: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1372,38 +1146,15 @@ server.tool(
   "trello_delete_card",
   "Exclui um card específico do Trello",
   {
-    cardId: z.string().optional().describe("ID do card a excluir"),
+    cardId: trelloId.optional().describe("ID do card a excluir"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ cardId, cardName, boardUrl }) => {
-    const cfg = loadConfig();
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName, true);
     
     try {
       const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}`);
@@ -1417,6 +1168,7 @@ server.tool(
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao excluir card: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1430,7 +1182,7 @@ server.tool(
   "trello_delete_all_cards",
   "Exclui todos os cards de uma lista específica ou de todo o quadro",
   {
-    listId: z.string().trim().min(1).optional().describe("ID da lista; sem listId e listName, opera no quadro todo"),
+    listId: trelloId.optional().describe("ID da lista; sem listId e listName, opera no quadro todo"),
     listName: z.string().trim().min(1).optional().describe("Nome exato da lista; use listId se houver nomes repetidos"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
     confirm: z.boolean().describe("Confirmação obrigatória: true para executar a exclusão")
@@ -1445,7 +1197,6 @@ server.tool(
       };
     }
     
-    const cfg = loadConfig();
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
@@ -1506,7 +1257,7 @@ server.tool(
   "trello_archive_all_cards",
   "Arquiva (fecha) todos os cards de uma lista ou do quadro todo - alternativa à exclusão",
   {
-    listId: z.string().trim().min(1).optional().describe("ID da lista; sem listId e listName, opera no quadro todo"),
+    listId: trelloId.optional().describe("ID da lista; sem listId e listName, opera no quadro todo"),
     listName: z.string().trim().min(1).optional().describe("Nome exato da lista; use listId se houver nomes repetidos"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
     confirm: z.boolean().describe("Confirmação obrigatória: true para executar")
@@ -1521,7 +1272,6 @@ server.tool(
       };
     }
     
-    const cfg = loadConfig();
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
@@ -1573,7 +1323,6 @@ server.tool(
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ boardUrl }) => {
-    const cfg = loadConfig();
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
@@ -1620,7 +1369,6 @@ server.tool(
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ boardUrl }) => {
-    const cfg = loadConfig();
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
@@ -1647,12 +1395,11 @@ server.tool(
   "trello_list_cards_in_list",
   "Lista os cards de uma lista específica do Trello",
   {
-    listId: z.string().trim().min(1).optional().describe("ID da lista escolhida"),
+    listId: trelloId.optional().describe("ID da lista escolhida"),
     listName: z.string().trim().min(1).optional().describe("Nome exato da lista; use listId se houver nomes repetidos"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ listId, listName, boardUrl }) => {
-    const cfg = loadConfig();
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
@@ -1722,6 +1469,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao criar lista: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1735,7 +1483,7 @@ server.tool(
   "trello_update_list",
   "Atualiza uma lista (coluna) existente do Trello",
   {
-    listId: z.string().optional().describe("ID da lista (alternativa ao nome)"),
+    listId: trelloId.optional().describe("ID da lista (alternativa ao nome)"),
     listName: z.string().optional().describe("Nome exato da lista (alternativa ao ID)"),
     newName: z.string().optional().describe("Novo nome para a lista"),
     newPos: z.number().optional().describe("Nova posição da lista (número, 'top', 'bottom')"),
@@ -1766,6 +1514,7 @@ server.tool(
     
     if (Object.keys(updateData).length === 0) {
       return {
+        isError: true,
         content: [{ 
           type: "text", 
           text: "❌ Forneça pelo menos um campo para atualizar: newName ou newPos" 
@@ -1786,6 +1535,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao atualizar lista: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1797,31 +1547,45 @@ server.tool(
 
 server.tool(
   "trello_delete_list",
-  "Exclui uma lista (coluna) de um quadro do Trello",
+  "Arquiva uma lista (coluna) do quadro; com permanent e confirm, exclui a lista e seus cards em definitivo",
   {
-    listId: z.string().optional().describe("ID da lista (alternativa ao nome)"),
+    listId: trelloId.optional().describe("ID da lista (alternativa ao nome)"),
     listName: z.string().optional().describe("Nome exato da lista (alternativa ao ID)"),
-    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
+    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
+    permanent: z.boolean().optional().describe("Excluir em definitivo, junto com os cards da lista, em vez de arquivar. Exige confirm: true"),
+    confirm: z.boolean().optional().describe("Obrigatório (true) para a exclusão permanente, que não pode ser desfeita")
   },
-  async ({ listId, listName, boardUrl }) => {
+  async ({ listId, listName, boardUrl, permanent, confirm }) => {
+    if (permanent && confirm !== true) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "⚠️ Exclusão permanente não executada. Ela remove a lista e seus cards e não pode ser desfeita: repita com confirm: true, ou omita permanent para apenas arquivar." }],
+      };
+    }
+
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
-    
+
     const destination = selectList(await getBoardLists(creds, boardId), listId, listName);
     const targetListId = destination.id;
-    const listNameDeleted = destination.name;
 
     try {
-      await fetchTrelloWithCreds(creds, `/lists/${targetListId}`, "DELETE");
-      
-      let text = `✅ **Lista Excluída**\n\n`;
-      text += `🗑️ **${listNameDeleted}**\n`;
+      // A API do Trello só exclui listas já arquivadas; arquivar é também o padrão reversível.
+      await fetchTrelloWithCreds(creds, `/lists/${targetListId}/closed`, "PUT", { value: true });
+      if (permanent) {
+        await fetchTrelloWithCreds(creds, `/lists/${targetListId}`, "DELETE");
+      }
+
+      let text = permanent ? `✅ **Lista Excluída Permanentemente**\n\n` : `✅ **Lista Arquivada**\n\n`;
+      text += `${permanent ? "🗑️" : "📦"} **${destination.name}**\n`;
       text += `🆔 ${targetListId}\n`;
+      if (!permanent) text += `\nA lista foi arquivada e pode ser restaurada no Trello.\n`;
       text += `\n🔗 https://trello.com/b/${boardId}`;
-      
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao excluir lista: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1893,7 +1657,7 @@ server.tool(
   "trello_update_label",
   "Atualiza uma etiqueta (label) existente do Trello",
   {
-    labelId: z.string().optional().describe("ID da label (alternativa ao nome)"),
+    labelId: trelloId.optional().describe("ID da label (alternativa ao nome)"),
     labelName: z.string().optional().describe("Nome ou parte do nome da label (alternativa ao ID)"),
     newName: z.string().optional().describe("Novo nome para a label"),
     newColor: z.string().optional().describe("Nova cor: green, yellow, orange, red, purple, blue, sky, lime, pink, black"),
@@ -1907,26 +1671,13 @@ server.tool(
     
     if (!targetLabelId && labelName) {
       const labels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
-      const searchName = labelName.toLowerCase().trim();
-      const foundLabel = labels.find(l => 
-        l.name.toLowerCase().includes(searchName) || 
-        searchName.includes(l.name.toLowerCase())
-      );
-      
-      if (!foundLabel) {
-        const availableLabels = labels.map(l => l.name).join(", ");
-        return {
-          content: [{ 
-            type: "text", 
-            text: `❌ Label "${labelName}" não encontrada.\n\nLabels disponíveis:\n${availableLabels}` 
-          }],
-        };
-      }
+      const foundLabel = pickByName(labels, labelName, "Label");
       targetLabelId = foundLabel.id;
     }
     
     if (!targetLabelId) {
       return {
+        isError: true,
         content: [{ type: "text", text: "❌ Forneça labelId ou labelName" }],
       };
     }
@@ -1938,6 +1689,7 @@ server.tool(
     
     if (Object.keys(updateData).length === 0) {
       return {
+        isError: true,
         content: [{ 
           type: "text", 
           text: "❌ Forneça pelo menos um campo para atualizar: newName ou newColor" 
@@ -1964,6 +1716,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao atualizar label: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -1977,7 +1730,7 @@ server.tool(
   "trello_delete_label",
   "Exclui uma etiqueta (label) de um quadro do Trello",
   {
-    labelId: z.string().optional().describe("ID da label (alternativa ao nome)"),
+    labelId: trelloId.optional().describe("ID da label (alternativa ao nome)"),
     labelName: z.string().optional().describe("Nome ou parte do nome da label (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -1990,27 +1743,14 @@ server.tool(
     
     if (!targetLabelId && labelName) {
       const labels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
-      const searchName = labelName.toLowerCase().trim();
-      const foundLabel = labels.find(l => 
-        l.name.toLowerCase().includes(searchName) || 
-        searchName.includes(l.name.toLowerCase())
-      );
-      
-      if (!foundLabel) {
-        const availableLabels = labels.map(l => l.name).join(", ");
-        return {
-          content: [{ 
-            type: "text", 
-            text: `❌ Label "${labelName}" não encontrada.\n\nLabels disponíveis:\n${availableLabels}` 
-          }],
-        };
-      }
+      const foundLabel = pickByName(labels, labelName, "Label", true);
       targetLabelId = foundLabel.id;
       labelNameDeleted = foundLabel.name;
     }
     
     if (!targetLabelId) {
       return {
+        isError: true,
         content: [{ type: "text", text: "❌ Forneça labelId ou labelName" }],
       };
     }
@@ -2026,6 +1766,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao excluir label: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2048,18 +1789,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-    const searchName = cardName.toLowerCase().trim();
-    const card = allCards.find(c => 
-      c.name.toLowerCase().includes(searchName) || 
-      searchName.includes(c.name.toLowerCase())
-    );
-    
-    if (!card) {
-      return {
-        content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-      };
-    }
+    const card = pickByName(await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`), cardName, "Card");
     
     try {
       const checklist = await fetchTrelloWithCreds<{ id: string; name: string }>(
@@ -2090,6 +1820,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao criar checklist: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2103,7 +1834,7 @@ server.tool(
   "trello_get_checklists",
   "Lista os checklists de um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -2111,29 +1842,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name&checklists=all`);
@@ -2172,6 +1881,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao buscar checklists: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2185,9 +1895,9 @@ server.tool(
   "trello_update_checklist",
   "Atualiza o nome de um checklist em um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    checklistId: z.string().optional().describe("ID do checklist (alternativa ao nome)"),
+    checklistId: trelloId.optional().describe("ID do checklist (alternativa ao nome)"),
     checklistName: z.string().optional().describe("Nome do checklist a renomear"),
     newName: z.string().describe("Novo nome do checklist"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
@@ -2196,29 +1906,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       let targetChecklistId = checklistId;
@@ -2227,32 +1915,21 @@ server.tool(
       if (!targetChecklistId && checklistName) {
         const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name&checklists=all`);
         const checklists = cardDetails.checklists || [];
-        const foundChecklist = checklists.find(cl => 
-          cl.name.toLowerCase().includes(checklistName.toLowerCase())
-        );
-        
-        if (!foundChecklist) {
-          const availableChecklists = checklists.map(cl => cl.name).join(", ");
-          return {
-            content: [{ 
-              type: "text", 
-              text: `❌ Checklist "${checklistName}" não encontrado.\n\nChecklists disponíveis:\n${availableChecklists || "(nenhum)"}` 
-            }],
-          };
-        }
+        const foundChecklist = pickByName(checklists, checklistName, "Checklist");
         targetChecklistId = foundChecklist.id;
         oldName = foundChecklist.name;
       }
       
       if (!targetChecklistId) {
         return {
+          isError: true,
           content: [{ type: "text", text: "❌ Forneça checklistId ou checklistName" }],
         };
       }
       
       await fetchTrelloWithCreds(creds, `/checklists/${targetChecklistId}`, "PUT", { name: newName });
       
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       let text = `✅ **Checklist Atualizado**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
@@ -2263,6 +1940,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao atualizar checklist: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2286,29 +1964,10 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-    const searchName = cardName.toLowerCase().trim();
-    const card = allCards.find(c => 
-      c.name.toLowerCase().includes(searchName) || 
-      searchName.includes(c.name.toLowerCase())
-    );
-    
-    if (!card) {
-      return {
-        content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-      };
-    }
+    const card = pickByName(await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`), cardName, "Card");
     
     const checklists = await fetchTrelloWithCreds<TrelloChecklist[]>(creds, `/cards/${card.id}/checklists`);
-    const checklist = checklists.find(cl => 
-      cl.name.toLowerCase().includes(checklistName.toLowerCase())
-    );
-    
-    if (!checklist) {
-      return {
-        content: [{ type: "text", text: `❌ Checklist não encontrado: "${checklistName}"` }],
-      };
-    }
+    const checklist = pickByName(checklists, checklistName, "Checklist");
     
     try {
       await fetchTrelloWithCreds(creds, `/checklists/${checklist.id}/checkItems`, "POST", { 
@@ -2325,6 +1984,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao adicionar item: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2346,29 +2006,10 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-    const searchName = cardName.toLowerCase().trim();
-    const card = allCards.find(c => 
-      c.name.toLowerCase().includes(searchName) || 
-      searchName.includes(c.name.toLowerCase())
-    );
-    
-    if (!card) {
-      return {
-        content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-      };
-    }
+    const card = pickByName(await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`), cardName, "Card");
     
     const checklists = await fetchTrelloWithCreds<TrelloChecklist[]>(creds, `/cards/${card.id}/checklists`);
-    const checklist = checklists.find(cl => 
-      cl.name.toLowerCase().includes(checklistName.toLowerCase())
-    );
-    
-    if (!checklist) {
-      return {
-        content: [{ type: "text", text: `❌ Checklist não encontrado: "${checklistName}"` }],
-      };
-    }
+    const checklist = pickByName(checklists, checklistName, "Checklist");
     
     try {
       await fetchTrelloWithCreds(creds, `/checklists/${checklist.id}`, "DELETE");
@@ -2382,6 +2023,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao excluir checklist: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2404,39 +2046,12 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-    const searchName = cardName.toLowerCase().trim();
-    const card = allCards.find(c => 
-      c.name.toLowerCase().includes(searchName) || 
-      searchName.includes(c.name.toLowerCase())
-    );
-    
-    if (!card) {
-      return {
-        content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-      };
-    }
+    const card = pickByName(await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`), cardName, "Card");
     
     const checklists = await fetchTrelloWithCreds<TrelloChecklist[]>(creds, `/cards/${card.id}/checklists`);
-    const checklist = checklists.find(cl => 
-      cl.name.toLowerCase().includes(checklistName.toLowerCase())
-    );
+    const checklist = pickByName(checklists, checklistName, "Checklist");
     
-    if (!checklist) {
-      return {
-        content: [{ type: "text", text: `❌ Checklist não encontrado: "${checklistName}"` }],
-      };
-    }
-    
-    const item = checklist.checkItems.find(i => 
-      i.name.toLowerCase().includes(itemName.toLowerCase())
-    );
-    
-    if (!item) {
-      return {
-        content: [{ type: "text", text: `❌ Item não encontrado: "${itemName}"` }],
-      };
-    }
+    const item = pickByName(checklist.checkItems, itemName, "Item");
     
     try {
       await fetchTrelloWithCreds(creds, `/checklists/${checklist.id}/checkItems/${item.id}`, "DELETE");
@@ -2450,6 +2065,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao excluir item: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2473,39 +2089,12 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-    const searchName = cardName.toLowerCase().trim();
-    const card = allCards.find(c => 
-      c.name.toLowerCase().includes(searchName) || 
-      searchName.includes(c.name.toLowerCase())
-    );
-    
-    if (!card) {
-      return {
-        content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-      };
-    }
+    const card = pickByName(await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`), cardName, "Card");
     
     const checklists = await fetchTrelloWithCreds<TrelloChecklist[]>(creds, `/cards/${card.id}/checklists`);
-    const checklist = checklists.find(cl => 
-      cl.name.toLowerCase().includes(checklistName.toLowerCase())
-    );
+    const checklist = pickByName(checklists, checklistName, "Checklist");
     
-    if (!checklist) {
-      return {
-        content: [{ type: "text", text: `❌ Checklist não encontrado: "${checklistName}"` }],
-      };
-    }
-    
-    const item = checklist.checkItems.find(i => 
-      i.name.toLowerCase().includes(itemName.toLowerCase())
-    );
-    
-    if (!item) {
-      return {
-        content: [{ type: "text", text: `❌ Item não encontrado: "${itemName}"` }],
-      };
-    }
+    const item = pickByName(checklist.checkItems, itemName, "Item");
     
     try {
       await fetchTrelloWithCreds(creds, `/cards/${card.id}/checkItem/${item.id}`, "PUT", { 
@@ -2522,6 +2111,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao atualizar item: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2535,9 +2125,9 @@ server.tool(
   "trello_delete_comment",
   "Exclui um comentário de um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    commentId: z.string().optional().describe("ID do comentário (action ID) a excluir"),
+    commentId: trelloId.optional().describe("ID do comentário (action ID) a excluir"),
     commentIndex: z.number().optional().describe("Índice do comentário (1 = mais recente, 2 = segundo mais recente, etc)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -2545,29 +2135,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       let actionIdToDelete: string | undefined;
@@ -2579,6 +2147,7 @@ server.tool(
         
         if (comments.length === 0) {
           return {
+            isError: true,
             content: [{ type: "text", text: "❌ Nenhum comentário encontrado neste card" }],
           };
         }
@@ -2587,6 +2156,7 @@ server.tool(
         
         if (commentIndex < 1 || commentIndex > sortedComments.length) {
           return {
+            isError: true,
             content: [{ 
               type: "text", 
               text: `❌ Índice inválido. O card tem ${sortedComments.length} comentário(s). Use commentIndex de 1 a ${sortedComments.length} (1 = mais recente).` 
@@ -2597,6 +2167,7 @@ server.tool(
         actionIdToDelete = sortedComments[commentIndex - 1].id;
       } else {
         return {
+          isError: true,
           content: [{ 
             type: "text", 
             text: "❌ Forneça commentId (ID do comentário) ou commentIndex (número ordinal do comentário). Use trello_get_comments primeiro para ver os IDs." 
@@ -2606,11 +2177,12 @@ server.tool(
       
       if (!actionIdToDelete) {
         return {
+          isError: true,
           content: [{ type: "text", text: "❌ Não foi possível determinar qual comentário excluir" }],
         };
       }
       
-      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/actions/${actionIdToDelete}`, "DELETE");
+      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/actions/${actionIdToDelete}/comments`, "DELETE");
       
       const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}`);
       
@@ -2622,6 +2194,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao excluir comentário: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2635,9 +2208,9 @@ server.tool(
   "trello_update_comment",
   "Atualiza o texto de um comentário de um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    commentId: z.string().optional().describe("ID do comentário (action ID) a editar"),
+    commentId: trelloId.optional().describe("ID do comentário (action ID) a editar"),
     commentIndex: z.number().optional().describe("Índice do comentário (1 = mais recente, 2 = segundo mais recente, etc)"),
     newText: z.string().describe("Novo texto do comentário"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
@@ -2646,29 +2219,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const searchName = cardName.toLowerCase().trim();
-      const card = allCards.find(c => 
-        c.name.toLowerCase().includes(searchName) || 
-        searchName.includes(c.name.toLowerCase())
-      );
-      
-      if (!card) {
-        return {
-          content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }],
-        };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return {
-        content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }],
-      };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       let actionIdToUpdate: string | undefined;
@@ -2684,6 +2235,7 @@ server.tool(
         
         if (comments.length === 0) {
           return {
+            isError: true,
             content: [{ type: "text", text: "❌ Nenhum comentário encontrado neste card" }],
           };
         }
@@ -2692,6 +2244,7 @@ server.tool(
         
         if (commentIndex < 1 || commentIndex > sortedComments.length) {
           return {
+            isError: true,
             content: [{ 
               type: "text", 
               text: `❌ Índice inválido. O card tem ${sortedComments.length} comentário(s). Use commentIndex de 1 a ${sortedComments.length} (1 = mais recente).` 
@@ -2703,6 +2256,7 @@ server.tool(
         oldText = sortedComments[commentIndex - 1].data.text;
       } else {
         return {
+          isError: true,
           content: [{ 
             type: "text", 
             text: "❌ Forneça commentId (ID do comentário) ou commentIndex (número ordinal do comentário). Use trello_get_comments primeiro para ver os IDs." 
@@ -2712,6 +2266,7 @@ server.tool(
       
       if (!actionIdToUpdate) {
         return {
+          isError: true,
           content: [{ type: "text", text: "❌ Não foi possível determinar qual comentário editar" }],
         };
       }
@@ -2729,6 +2284,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao atualizar comentário: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2765,7 +2321,7 @@ server.tool(
       
       for (const member of members) {
         text += `• **${member.fullName}**\n`;
-        text += `  @${member.username}\n`;
+        text += `  @${member.username}\n  🆔 ${member.id}\n`;
         if (member.avatarUrl) {
           text += `  🖼️ Avatar disponível\n`;
         }
@@ -2775,6 +2331,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao listar membros: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2788,7 +2345,7 @@ server.tool(
   "trello_add_board_member",
   "Adiciona um membro a um quadro do Trello",
   {
-    email: z.string().describe("Email do usuário a adicionar"),
+    email: z.string().trim().email("Email inválido").describe("Email do usuário a adicionar"),
     fullName: z.string().optional().describe("Nome completo (obrigatório se email não encontrado)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -2810,6 +2367,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao adicionar membro: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2823,8 +2381,8 @@ server.tool(
   "trello_remove_board_member",
   "Remove um membro de um quadro do Trello",
   {
-    memberId: z.string().optional().describe("ID do membro (alternativa ao email)"),
-    email: z.string().optional().describe("Email do membro a remover"),
+    memberId: trelloId.optional().describe("ID do membro (alternativa ao email)"),
+    email: z.string().optional().describe("@username ou nome completo exato do membro (a API não expõe emails dos membros)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ memberId, email, boardUrl }) => {
@@ -2835,15 +2393,16 @@ server.tool(
     
     if (!targetMemberId && email) {
       const members = await fetchTrelloWithCreds<TrelloMember[]>(creds, `/boards/${boardId}/members`);
-      const member = members.find(m => m.id === email || m.username === email || m.fullName.toLowerCase().includes(email.toLowerCase()));
-      if (member) {
-        targetMemberId = member.id;
-      }
+      const wanted = email.trim().toLowerCase().replace(/^@/, "");
+      const matches = members.filter(m => m.username.toLowerCase() === wanted || m.fullName.trim().toLowerCase() === wanted);
+      if (matches.length > 1) throw new Error("Mais de um membro corresponde a esse nome; informe memberId");
+      targetMemberId = matches[0]?.id;
     }
     
     if (!targetMemberId) {
       return {
-        content: [{ type: "text", text: "❌ Forneça memberId ou email válido" }],
+        isError: true,
+        content: [{ type: "text", text: "❌ Membro não encontrado: informe memberId, o @username ou o nome completo exato" }],
       };
     }
     
@@ -2857,6 +2416,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: "text",
           text: `❌ Erro ao remover membro: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
@@ -2870,7 +2430,7 @@ server.tool(
   "trello_list_card_members",
   "Lista os membros de um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -2878,24 +2438,11 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       const members = await fetchTrelloWithCreds<TrelloMember[]>(creds, `/cards/${targetCardId}/members`);
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       if (members.length === 0) {
         return { content: [{ type: "text", text: `👤 Nenhum membro neste card\n📌 ${cardDetails.name}` }] };
@@ -2904,12 +2451,13 @@ server.tool(
       let text = `👤 **Membros do Card** (${members.length})\n\n📌 ${cardDetails.name}\n\n`;
       
       for (const member of members) {
-        text += `• **${member.fullName}** (@${member.username})\n`;
+        text += `• **${member.fullName}** (@${member.username})\n  🆔 ${member.id}\n`;
       }
       
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -2920,34 +2468,21 @@ server.tool(
   "trello_add_card_member",
   "Adiciona um membro a um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    memberId: z.string().describe("ID do membro a adicionar"),
+    memberId: trelloId.describe("ID do membro a adicionar"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ cardId, cardName, memberId, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
-      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/members`, "POST", { idMember: memberId });
+      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/idMembers`, "POST", { value: memberId });
       
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       let text = `✅ **Membro Adicionado ao Card**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
@@ -2957,6 +2492,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -2967,34 +2503,21 @@ server.tool(
   "trello_remove_card_member",
   "Remove um membro de um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    memberId: z.string().describe("ID do membro a remover"),
+    memberId: trelloId.describe("ID do membro a remover"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ cardId, cardName, memberId, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
-      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/members/${memberId}`, "DELETE");
+      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/idMembers/${memberId}`, "DELETE");
       
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       let text = `✅ **Membro Removido do Card**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
@@ -3004,6 +2527,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3014,55 +2538,57 @@ server.tool(
 // BUSCA (SEARCH)
 // ==========================================
 
+const SEARCH_CARD_FIELDS = "fields=name,desc,shortUrl,idList,idBoard,idLabels,due,dueComplete";
+
+function matchesQuery(card: TrelloCard, query: string): boolean {
+  const wanted = query.trim().toLowerCase();
+  return card.name.toLowerCase().includes(wanted) || (card.desc ?? "").toLowerCase().includes(wanted);
+}
+
+/** Lista cards com o ID, que as demais ferramentas exigem, e avisa quando há mais resultados que o exibido. */
+function formatCards(cards: TrelloCard[], max = 50): string {
+  let text = "";
+  for (const card of cards.slice(0, max)) {
+    text += `• ${card.name}\n  🆔 ${card.id}\n  🔗 ${card.shortUrl}\n\n`;
+  }
+  if (cards.length > max) text += `... e mais ${cards.length - max} cards não exibidos`;
+  return text;
+}
+
 server.tool(
   "trello_search_cards",
-  "Busca cards por texto em todos os quadros",
+  "Busca cards abertos por texto no título ou na descrição, em um quadro ou em todos os quadros abertos",
   {
-    query: z.string().describe("Texto para buscar (nome ou descrição)"),
-    boardUrl: z.string().optional().describe("Limpar busca a um quadro específico (opcional)")
+    query: z.string().trim().min(1).describe("Texto para buscar (título ou descrição)"),
+    boardUrl: z.string().optional().describe("Limita a busca a um quadro específico (opcional)")
   },
   async ({ query, boardUrl }) => {
     const creds = getCredentials();
-    const boardId = boardUrl ? await resolveBoardId(boardUrl, creds) : null;
-    
+
     try {
-      let cards: TrelloCard[];
-      
-      if (boardId) {
-        cards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-        cards = cards.filter(c => 
-          c.name.toLowerCase().includes(query.toLowerCase())
-        );
-      } else {
-        const boards = await fetchTrelloWithCreds<TrelloBoard[]>(creds, "/members/me/boards");
-        const openBoards = boards.filter(b => !b.closed);
-        
-        cards = [];
-        for (const board of openBoards.slice(0, 10)) {
-          const boardCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${board.id}/cards/open`);
-          cards.push(...boardCards.filter(c => c.name.toLowerCase().includes(query.toLowerCase())));
-        }
+      const boardIds = boardUrl
+        ? [await resolveBoardId(boardUrl, creds)]
+        : (await fetchTrelloWithCreds<TrelloBoard[]>(creds, "/members/me/boards")).filter(b => !b.closed).map(b => b.id);
+
+      // Um quadro por vez: mantém a busca dentro do limite de requisições do Trello.
+      const cards: TrelloCard[] = [];
+      for (const id of boardIds) {
+        const boardCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${id}/cards/open?${SEARCH_CARD_FIELDS}`);
+        cards.push(...boardCards.filter(card => matchesQuery(card, query)));
       }
-      
+
       if (cards.length === 0) {
         return { content: [{ type: "text", text: `🔍 Nenhum card encontrado para: "${query}"` }] };
       }
-      
-      let text = `🔍 **Resultados da Busca** (${cards.length} cards)\n\n`;
+
+      let text = `🔍 **Resultados da Busca** (${cards.length} cards em ${boardIds.length} quadro(s))\n\n`;
       text += `Busca: "${query}"\n\n`;
-      
-      for (const card of cards.slice(0, 20)) {
-        text += `• ${card.name}\n`;
-        text += `  🔗 ${card.shortUrl}\n\n`;
-      }
-      
-      if (cards.length > 20) {
-        text += `... e mais ${cards.length - 20} cards`;
-      }
-      
+      text += formatCards(cards);
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3073,39 +2599,31 @@ server.tool(
   "trello_search_by_label",
   "Busca cards por etiqueta em um quadro",
   {
-    labelName: z.string().describe("Nome da label para buscar"),
+    labelName: z.string().trim().min(1).describe("Nome da label (exato, ou um trecho que identifique uma única label)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ labelName, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
-    
+
     try {
       const labels = await fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`);
-      const label = labels.find(l => l.name.toLowerCase().includes(labelName.toLowerCase()));
-      
-      if (!label) {
-        const availableLabels = labels.map(l => l.name).join(", ");
-        return { content: [{ type: "text", text: `❌ Label "${labelName}" não encontrada.\n\nLabels: ${availableLabels}` }] };
-      }
-      
-      const cards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
+      const label = pickByName(labels, labelName, "Label");
+
+      const cards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open?${SEARCH_CARD_FIELDS}`);
       const cardsWithLabel = cards.filter(c => c.idLabels.includes(label.id));
-      
+
       if (cardsWithLabel.length === 0) {
         return { content: [{ type: "text", text: `📭 Nenhum card com label "${label.name}"` }] };
       }
-      
+
       let text = `🏷️ **Cards com Label "${label.name}"** (${cardsWithLabel.length})\n\n`;
-      
-      for (const card of cardsWithLabel.slice(0, 20)) {
-        text += `• ${card.name}\n`;
-        text += `  🔗 ${card.shortUrl}\n\n`;
-      }
-      
+      text += formatCards(cardsWithLabel);
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3116,56 +2634,46 @@ server.tool(
   "trello_search_by_due",
   "Busca cards por data de vencimento",
   {
-    filter: z.enum(["overdue", "due_soon", "no_due", "all"]).describe("Filtro: overdue (atrasados), due_soon (próximos 7 dias), no_due (sem data), all (todos com data)"),
+    filter: z.enum(["overdue", "due_soon", "no_due", "all"]).describe("Filtro: overdue (atrasados e não concluídos), due_soon (vencem nos próximos 7 dias e não concluídos), no_due (sem data), all (todos com data)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ filter, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
-    
+
     try {
-      const cards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      
-      const now = new Date();
-      const in7Days = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-      
-      let filteredCards: TrelloCard[] = [];
-      
-      for (const card of cards) {
-        const cardDetails = await fetchTrelloWithCreds<{ due: string | null }>(creds, `/cards/${card.id}?fields=due`);
-        
-        if (filter === "no_due" && !cardDetails.due) {
-          filteredCards.push(card);
-        } else if (filter === "overdue" && cardDetails.due && new Date(cardDetails.due) < now) {
-          filteredCards.push(card);
-        } else if (filter === "due_soon" && cardDetails.due && new Date(cardDetails.due) >= now && new Date(cardDetails.due) <= in7Days) {
-          filteredCards.push(card);
-        } else if (filter === "all" && cardDetails.due) {
-          filteredCards.push(card);
-        }
-      }
-      
+      // A listagem já traz due e dueComplete: uma requisição, em vez de uma por card.
+      const cards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open?${SEARCH_CARD_FIELDS}`);
+      const now = Date.now();
+      const in7Days = now + 7 * 24 * 60 * 60 * 1000;
+
+      const filteredCards = cards.filter(card => {
+        const due = card.due ? new Date(card.due).getTime() : null;
+        if (filter === "no_due") return due === null;
+        if (due === null) return false;
+        if (filter === "all") return true;
+        if (card.dueComplete) return false;
+        return filter === "overdue" ? due < now : due >= now && due <= in7Days;
+      });
+
       const filterLabels: Record<string, string> = {
-        overdue: "🟢 Atrasados",
+        overdue: "🔴 Atrasados",
         due_soon: "⏰ Próximos 7 dias",
         no_due: "❌ Sem data",
         all: "📅 Com data"
       };
-      
+
       if (filteredCards.length === 0) {
         return { content: [{ type: "text", text: `📭 Nenhum card: ${filterLabels[filter]}` }] };
       }
-      
+
       let text = `${filterLabels[filter]} (${filteredCards.length})\n\n`;
-      
-      for (const card of filteredCards.slice(0, 20)) {
-        text += `• ${card.name}\n`;
-        text += `  🔗 ${card.shortUrl}\n\n`;
-      }
-      
+      text += formatCards(filteredCards);
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3180,7 +2688,7 @@ server.tool(
   "trello_list_attachments",
   "Lista os anexos de um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -3188,24 +2696,11 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       const attachments = await fetchTrelloWithCreds<TrelloAttachment[]>(creds, `/cards/${targetCardId}/attachments`);
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       if (attachments.length === 0) {
         return { content: [{ type: "text", text: `📎 Nenhum anexo neste card\n📌 ${cardDetails.name}` }] };
@@ -3216,6 +2711,7 @@ server.tool(
       for (const att of attachments) {
         const size = att.bytes ? `${Math.round(att.bytes / 1024)}KB` : "tamanho desconhecido";
         text += `• **${att.name}**\n`;
+        text += `  🆔 ${att.id}\n`;
         text += `  📊 ${size}\n`;
         text += `  🔗 ${att.url}\n`;
         if (att.mimeType) text += `  📋 ${att.mimeType}\n`;
@@ -3225,6 +2721,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3235,34 +2732,21 @@ server.tool(
   "trello_delete_attachment",
   "Exclui um anexo de um card do Trello",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    attachmentId: z.string().describe("ID do anexo a excluir"),
+    attachmentId: trelloId.describe("ID do anexo a excluir"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ cardId, cardName, attachmentId, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/attachments/${attachmentId}`, "DELETE");
       
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       let text = `✅ **Anexo Excluído**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
@@ -3272,6 +2756,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3286,33 +2771,20 @@ server.tool(
   "trello_get_card_activities",
   "Busca o histórico de atividades de um card",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    limit: z.number().optional().describe("Número de atividades (padrão: 20)"),
+    limit: z.number().int().min(1).max(1000).optional().describe("Número de atividades (padrão: 20)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
   async ({ cardId, cardName, limit = 20, boardUrl }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       const actions = await fetchTrelloWithCreds<any[]>(creds, `/cards/${targetCardId}/actions?limit=${limit}`);
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       if (actions.length === 0) {
         return { content: [{ type: "text", text: `📝 Nenhuma atividade neste card\n📌 ${cardDetails.name}` }] };
@@ -3350,6 +2822,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3386,7 +2859,7 @@ server.tool(
       const cardsWithLabels = cards.filter(c => c.idLabels.length > 0).length;
       const cardsWithDue = cards.filter(c => c.due).length;
       const now = new Date();
-      const overdueCards = cards.filter(c => c.due && new Date(c.due) < now).length;
+      const overdueCards = cards.filter(c => c.due && !c.dueComplete && new Date(c.due) < now).length;
       
       let text = `📊 **Estatísticas do Quadro**\n\n📋 **${board.name}**\n\n`;
       
@@ -3403,7 +2876,7 @@ server.tool(
       
       text += `\n📅 **Datas de Vencimento**\n`;
       text += `  ⏰ Com data: ${cardsWithDue}\n`;
-      text += `  🟢 Atrasados: ${overdueCards}\n`;
+      text += `  🔴 Atrasados: ${overdueCards}\n`;
       
       text += `\n🏷️ **Labels**\n`;
       for (const label of labels.slice(0, 5)) {
@@ -3417,6 +2890,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3431,7 +2905,7 @@ server.tool(
   "trello_vote_card",
   "Adiciona um voto a um card",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -3439,25 +2913,13 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
-      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/votes`, "POST", {});
+      const me = await fetchTrelloWithCreds<{ id: string }>(creds, "/members/me");
+      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/membersVoted`, "POST", { value: me.id });
       
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       let text = `✅ **Voto Adicionado**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
@@ -3466,6 +2928,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3476,7 +2939,7 @@ server.tool(
   "trello_unvote_card",
   "Remove o voto de um card",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -3484,26 +2947,13 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       const me = await fetchTrelloWithCreds<{ id: string }>(creds, "/members/me");
-      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/members/${me.id}`, "DELETE");
+      await fetchTrelloWithCreds(creds, `/cards/${targetCardId}/membersVoted/${me.id}`, "DELETE");
       
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       let text = `✅ **Voto Removido**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
@@ -3512,6 +2962,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3522,7 +2973,7 @@ server.tool(
   "trello_list_card_votes",
   "Lista os votos de um card",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -3530,24 +2981,11 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       const votes = await fetchTrelloWithCreds<TrelloMember[]>(creds, `/cards/${targetCardId}/membersVoted`);
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       if (votes.length === 0) {
         return { content: [{ type: "text", text: `🗳️ Nenhum voto neste card\n📌 ${cardDetails.name}` }] };
@@ -3562,6 +3000,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3572,9 +3011,9 @@ server.tool(
   "trello_upload_attachment",
   "Faz upload de um anexo para um card",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    fileUrl: z.string().describe("URL pública do arquivo para upload"),
+    fileUrl: z.string().trim().url("URL inválida").refine(value => /^https?:\/\//i.test(value), "Use uma URL http(s)").describe("URL pública (http/https) do arquivo; o Trello baixa o arquivo dessa URL"),
     fileName: z.string().optional().describe("Nome do arquivo (opcional, será extraído da URL se não fornecido)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -3582,45 +3021,16 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       const name = fileName || fileUrl.split("/").pop() || "arquivo";
       
-      const response = await requestTrello(
-        `https://api.trello.com/1/cards/${targetCardId}/attachments?key=${creds.apiKey}&token=${creds.token}`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            url: fileUrl,
-            name: name
-          }),
-        }
-      );
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Trello API error: ${response.status} - ${errorText}`);
-      }
-      
-      const attachment = await response.json() as TrelloAttachment;
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const attachment = await fetchTrelloWithCreds<TrelloAttachment>(creds, `/cards/${targetCardId}/attachments`, "POST", {
+        url: fileUrl,
+        name: name
+      });
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       let text = `✅ **Anexo Enviado**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
@@ -3630,6 +3040,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3640,9 +3051,9 @@ server.tool(
   "trello_download_attachment",
   "Obtém a URL de download de um anexo",
   {
-    cardId: z.string().optional().describe("ID do card (alternativa ao nome)"),
+    cardId: trelloId.optional().describe("ID do card (alternativa ao nome)"),
     cardName: z.string().optional().describe("Nome ou parte do nome do card (alternativa ao ID)"),
-    attachmentId: z.string().optional().describe("ID do anexo (alternativa ao nome)"),
+    attachmentId: trelloId.optional().describe("ID do anexo (alternativa ao nome)"),
     attachmentName: z.string().optional().describe("Nome do anexo (alternativa ao ID)"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
   },
@@ -3650,20 +3061,7 @@ server.tool(
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
     
-    let targetCardId = cardId;
-    
-    if (!targetCardId && cardName) {
-      const allCards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/open`);
-      const card = allCards.find(c => c.name.toLowerCase().includes(cardName.toLowerCase()));
-      if (!card) {
-        return { content: [{ type: "text", text: `❌ Card não encontrado: "${cardName}"` }] };
-      }
-      targetCardId = card.id;
-    }
-    
-    if (!targetCardId) {
-      return { content: [{ type: "text", text: "❌ Forneça cardId ou cardName" }] };
-    }
+    const targetCardId = await resolveCardId(creds, boardId, cardId, cardName);
     
     try {
       let attachments = await fetchTrelloWithCreds<TrelloAttachment[]>(creds, `/cards/${targetCardId}/attachments`);
@@ -3679,10 +3077,10 @@ server.tool(
       }
       
       if (!targetAttachment) {
-        return { content: [{ type: "text", text: "❌ Anexo não encontrado" }] };
+        return { isError: true, content: [{ type: "text", text: "❌ Anexo não encontrado" }] };
       }
       
-      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name`);
+      const cardDetails = await fetchTrelloWithCreds<TrelloCardDetails>(creds, `/cards/${targetCardId}?fields=name,shortUrl`);
       
       let text = `📥 **Download de Anexo**\n\n`;
       text += `📌 Card: ${cardDetails.name}\n`;
@@ -3693,45 +3091,68 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
   }
 );
 
+interface TrelloPlugin {
+  id: string;
+  name?: string;
+  listing?: { name?: string };
+}
+
+const pluginName = (plugin: TrelloPlugin) => plugin.listing?.name || plugin.name || "(sem nome)";
+
+function powerUpError(error: unknown): string {
+  const message = error instanceof Error ? error.message : "Erro";
+  return /\b403\b/.test(message) ? `O Trello recusou a operação (403). A API pública marca esta rota como obsoleta e pode não permitir ativar ou desativar Power-Ups com token de API; nesse caso, altere pelo menu Power-Ups do quadro.` : message;
+}
+
 server.tool(
   "trello_list_power_ups",
-  "Lista os Power-Ups disponíveis e seus status no quadro",
+  "Lista os Power-Ups ativados no quadro, com IDs. Com search, também procura Power-Ups disponíveis para ativar",
   {
-    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)")
+    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
+    search: z.string().trim().min(1).optional().describe("Trecho do nome para procurar entre os Power-Ups disponíveis (opcional)")
   },
-  async ({ boardUrl }) => {
+  async ({ boardUrl, search }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
-    
+
     try {
-      const board = await fetchTrelloWithCreds<{ name: string; powerUps: string[] }>(
-        creds, 
-        `/boards/${boardId}?fields=name,powerUps`
-      );
-      
-      const allPowerUps = await fetchTrelloWithCreds<TrelloPowerUp[]>(creds, `/powerUps`);
-      
+      const board = await fetchTrelloWithCreds<{ name: string }>(creds, `/boards/${boardId}?fields=name`);
+      const enabled = await fetchTrelloWithCreds<TrelloPlugin[]>(creds, `/boards/${boardId}/plugins?filter=enabled`);
+
       let text = `⚡ **Power-Ups do Quadro**\n\n📋 ${board.name}\n\n`;
-      
-      if (board.powerUps.length === 0) {
+
+      if (enabled.length === 0) {
         text += "Nenhum Power-Up ativado.\n";
       } else {
-        text += `Ativados (${board.powerUps.length}):\n`;
-        for (const p of board.powerUps) {
-          const powerUp = allPowerUps.find(pu => pu.id === p);
-          text += `  ✅ ${powerUp?.name || p}\n`;
+        text += `Ativados (${enabled.length}):\n`;
+        for (const plugin of enabled) {
+          text += `  ✅ ${pluginName(plugin)}\n     🆔 ${plugin.id}\n`;
         }
       }
-      
+
+      if (search) {
+        const available = await fetchTrelloWithCreds<TrelloPlugin[]>(creds, `/boards/${boardId}/plugins?filter=available`);
+        const wanted = search.toLowerCase();
+        const enabledIds = new Set(enabled.map(plugin => plugin.id));
+        const matches = available.filter(plugin => !enabledIds.has(plugin.id) && pluginName(plugin).toLowerCase().includes(wanted));
+        text += `\nDisponíveis com "${search}" (${matches.length}):\n`;
+        for (const plugin of matches.slice(0, 20)) {
+          text += `  • ${pluginName(plugin)}\n     🆔 ${plugin.id}\n`;
+        }
+        if (matches.length > 20) text += `  ... e mais ${matches.length - 20}; refine a busca\n`;
+      }
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3740,33 +3161,29 @@ server.tool(
 
 server.tool(
   "trello_enable_power_up",
-  "Ativa um Power-Up no quadro",
+  "Ativa um Power-Up no quadro. Usa uma rota obsoleta da API, que o Trello pode recusar (403) para tokens de API",
   {
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
-    powerUpId: z.string().describe("ID do Power-Up a ativar (ex: calendar, cardAging, voting)")
+    powerUpId: trelloId.describe("ID do Power-Up, obtido em trello_list_power_ups com search")
   },
   async ({ boardUrl, powerUpId }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
-    
+
     try {
-      await fetchTrelloWithCreds(
-        creds, 
-        `/boards/${boardId}/powerUps`,
-        "POST",
-        { value: powerUpId }
-      );
-      
+      await fetchTrelloWithCreds(creds, `/boards/${boardId}/boardPlugins`, "POST", { idPlugin: powerUpId });
+
       const board = await fetchTrelloWithCreds<{ name: string }>(creds, `/boards/${boardId}?fields=name`);
-      
+
       let text = `✅ **Power-Up Ativado**\n\n`;
       text += `📋 Quadro: ${board.name}\n`;
       text += `⚡ ID: ${powerUpId}`;
-      
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
+        isError: true,
+        content: [{ type: "text", text: `❌ Erro: ${powerUpError(error)}` }],
       };
     }
   }
@@ -3774,32 +3191,29 @@ server.tool(
 
 server.tool(
   "trello_disable_power_up",
-  "Desativa um Power-Up no quadro",
+  "Desativa um Power-Up no quadro. Usa uma rota obsoleta da API, que o Trello pode recusar (403) para tokens de API",
   {
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
-    powerUpId: z.string().describe("ID do Power-Up a desativar (ex: calendar, cardAging, voting)")
+    powerUpId: trelloId.describe("ID do Power-Up ativado, obtido em trello_list_power_ups")
   },
   async ({ boardUrl, powerUpId }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
-    
+
     try {
-      await fetchTrelloWithCreds(
-        creds, 
-        `/boards/${boardId}/powerUps/${powerUpId}`,
-        "DELETE"
-      );
-      
+      await fetchTrelloWithCreds(creds, `/boards/${boardId}/boardPlugins/${powerUpId}`, "DELETE");
+
       const board = await fetchTrelloWithCreds<{ name: string }>(creds, `/boards/${boardId}?fields=name`);
-      
+
       let text = `✅ **Power-Up Desativado**\n\n`;
       text += `📋 Quadro: ${board.name}\n`;
       text += `⚡ ID: ${powerUpId}`;
-      
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
+        isError: true,
+        content: [{ type: "text", text: `❌ Erro: ${powerUpError(error)}` }],
       };
     }
   }
@@ -3832,6 +3246,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3842,8 +3257,8 @@ server.tool(
   "trello_create_webhook",
   "Cria um novo webhook",
   {
-    callbackURL: z.string().describe("URL de callback para notificações"),
-    modelId: z.string().describe("ID do modelo (board ou card)"),
+    callbackURL: z.string().trim().url("URL inválida").refine(value => value.startsWith("https://"), "O callback deve usar HTTPS").describe("URL HTTPS de callback; recebe todas as atividades do modelo"),
+    modelId: trelloId.describe("ID do modelo (board ou card)"),
     description: z.string().optional().describe("Descrição do webhook")
   },
   async ({ callbackURL, modelId, description }) => {
@@ -3869,6 +3284,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3879,7 +3295,7 @@ server.tool(
   "trello_delete_webhook",
   "Deleta um webhook",
   {
-    webhookId: z.string().describe("ID do webhook a deletar")
+    webhookId: trelloId.describe("ID do webhook a deletar")
   },
   async ({ webhookId }) => {
     const creds = getCredentials();
@@ -3890,6 +3306,7 @@ server.tool(
       return { content: [{ type: "text", text: `✅ **Webhook Deletado**\n\n🆔 ${webhookId}` }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -3898,85 +3315,52 @@ server.tool(
 
 server.tool(
   "trello_search_in_board",
-  "Pesquisa avançada em um quadro",
+  "Pesquisa cards visíveis de um quadro por texto no título ou na descrição, com limite de resultados",
   {
-    query: z.string().describe("Termo de busca"),
+    query: z.string().trim().min(1).describe("Termo de busca"),
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
-    limit: z.number().optional().describe("Limite de resultados (padrão: 25)")
+    limit: z.number().int().min(1).max(1000).optional().describe("Máximo de resultados exibidos (padrão: 25)")
   },
   async ({ query, boardUrl, limit = 25 }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
-    
+
     try {
-      const cards = await fetchTrelloWithCreds<TrelloCard[]>(
-        creds, 
-        `/boards/${boardId}/cards?filter=visible&limit=${limit}`
-      );
-      
-      const matchingCards = cards.filter(c => 
-        c.name.toLowerCase().includes(query.toLowerCase())
-      );
-      
+      // Filtra antes de limitar: o limite vale para os resultados, não para os cards examinados.
+      const cards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards/visible?${SEARCH_CARD_FIELDS}`);
+      const matchingCards = cards.filter(card => matchesQuery(card, query));
+
       const board = await fetchTrelloWithCreds<{ name: string }>(creds, `/boards/${boardId}?fields=name`);
-      
+
       if (matchingCards.length === 0) {
         return { content: [{ type: "text", text: `🔍 Nenhum resultado para "${query}" em ${board.name}` }] };
       }
-      
+
       let text = `🔍 **Resultados da Busca**\n\n`;
       text += `📋 Quadro: ${board.name}\n`;
       text += `🔎 Query: "${query}"\n`;
       text += `📝 Encontrados: ${matchingCards.length}\n\n`;
-      
-      for (const card of matchingCards) {
-        text += `📌 **${card.name}**\n`;
-        text += `   🔗 ${card.shortUrl}\n\n`;
-      }
-      
+      text += formatCards(matchingCards, limit);
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
   }
 );
 
-server.tool(
-  "trello_create_automation",
-  "Cria uma automação (butler rule) no quadro",
-  {
-    boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
-    trigger: z.string().describe("Gatilho (ex: 'when a card is moved to Done')"),
-    action: z.string().describe("Ação (ex: 'post a comment \"Task completed!\"')")
-  },
-  async ({ boardUrl, trigger, action }) => {
-    const creds = getCredentials();
-    const boardId = await resolveBoardId(boardUrl, creds);
-    
-    try {
-      const board = await fetchTrelloWithCreds<{ name: string }>(creds, `/boards/${boardId}?fields=name`);
-      
-      let text = `⚠️ **Automação requer Power-Up Butler**\n\n`;
-      text += `Para criar automações no Trello, você precisa do Butler (Power-Up).\n\n`;
-      text += `Após ativar o Butler no quadro "${board.name}":\n\n`;
-      text += `**Gatilho:** ${trigger}\n`;
-      text += `**Ação:** ${action}\n\n`;
-      text += `Configure manualmente no botão "Automations" do quadro.`;
-      
-      return { content: [{ type: "text", text }] };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
-      };
-    }
-  }
-);
+// Aspas duplicadas conforme a RFC 4180; o apóstrofo inicial impede que planilhas executem o texto como fórmula.
+function csvCell(value: unknown): string {
+  const text = String(value ?? "");
+  return `"${(/^[=+\-@]/.test(text) ? `'${text}` : text).replace(/"/g, '""')}"`;
+}
 
 server.tool(
   "trello_export_board",
-  "Exporta um quadro para JSON",
+  "Exporta listas, cards abertos, etiquetas e membros de um quadro. Devolve o conteúdo em JSON, ou em CSV com uma linha por card",
   {
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
     format: z.enum(["json", "csv"]).optional().describe("Formato de export (padrão: json)")
@@ -3984,48 +3368,59 @@ server.tool(
   async ({ boardUrl, format = "json" }) => {
     const creds = getCredentials();
     const boardId = await resolveBoardId(boardUrl, creds);
-    
+
     try {
-      const board = await fetchTrelloWithCreds<Record<string, unknown>>(creds, `/boards/${boardId}`);
-      const lists = await fetchTrelloWithCreds<TrelloList[]>(creds, `/boards/${boardId}/lists`);
-      const cards = await fetchTrelloWithCreds<TrelloCard[]>(creds, `/boards/${boardId}/cards`);
-      const labels = await fetchTrelloWithCreds<Record<string, unknown>[]>(creds, `/boards/${boardId}/labels`);
-      const members = await fetchTrelloWithCreds<Record<string, unknown>[]>(creds, `/boards/${boardId}/members`);
-      
-      const exportData = {
-        exportedAt: new Date().toISOString(),
-        board: {
-          id: board.id,
-          name: board.name,
-          url: board.url
-        },
-        lists: lists.map(l => ({ id: l.id, name: l.name })),
-        cards: cards.map(c => ({
-          id: c.id,
-          name: c.name,
-          idList: c.idList,
-          labels: c.idLabels
-        })),
-        labels: labels.map(l => ({ id: l.id, name: l.name, color: l.color })),
-        members: members.map(m => ({ id: m.id, fullName: m.fullName, username: m.username }))
-      };
-      
-      let text = `📤 **Quadro Exportado**\n\n`;
-      text += `📋 ${board.name}\n\n`;
-      text += `📊 **Dados exportados:**\n`;
+      const [board, lists, cards, labels, members] = await Promise.all([
+        fetchTrelloWithCreds<{ id: string; name: string; desc: string; url: string }>(creds, `/boards/${boardId}?fields=name,desc,url`),
+        fetchTrelloWithCreds<TrelloList[]>(creds, `/boards/${boardId}/lists`),
+        fetchTrelloWithCreds<(TrelloCard & { idMembers: string[] })[]>(creds, `/boards/${boardId}/cards/open?fields=name,desc,idList,idLabels,idMembers,due,dueComplete,shortUrl`),
+        fetchTrelloWithCreds<TrelloBoardLabel[]>(creds, `/boards/${boardId}/labels`),
+        fetchTrelloWithCreds<TrelloMember[]>(creds, `/boards/${boardId}/members`),
+      ]);
+
+      const listName = new Map(lists.map(l => [l.id, l.name]));
+      const labelName = new Map(labels.map(l => [l.id, l.name || l.color]));
+      const memberName = new Map(members.map(m => [m.id, m.username]));
+      const rows = cards.map(c => ({
+        id: c.id,
+        name: c.name,
+        list: listName.get(c.idList) ?? c.idList,
+        labels: c.idLabels.map(id => labelName.get(id) ?? id),
+        members: (c.idMembers ?? []).map(id => memberName.get(id) ?? id),
+        due: c.due ?? null,
+        dueComplete: c.dueComplete ?? false,
+        url: c.shortUrl,
+        desc: c.desc ?? "",
+      }));
+
+      let data: string;
+      if (format === "csv") {
+        const header = ["id", "name", "list", "labels", "members", "due", "dueComplete", "url", "desc"];
+        const lines = rows.map(r => [r.id, r.name, r.list, r.labels.join("; "), r.members.join("; "), r.due ?? "", r.dueComplete, r.url, r.desc].map(csvCell).join(","));
+        data = [header.join(","), ...lines].join("\r\n");
+      } else {
+        data = JSON.stringify({
+          exportedAt: new Date().toISOString(),
+          board: { id: board.id, name: board.name, desc: board.desc, url: board.url },
+          lists: lists.map(l => ({ id: l.id, name: l.name })),
+          labels: labels.map(l => ({ id: l.id, name: l.name, color: l.color })),
+          members: members.map(m => ({ id: m.id, fullName: m.fullName, username: m.username })),
+          cards: rows,
+        }, null, 2);
+      }
+
+      let text = `📤 **Quadro Exportado** (${format.toUpperCase()})\n\n`;
+      text += `📋 ${board.name}\n`;
       text += `  📝 Listas: ${lists.length}\n`;
-      text += `  📌 Cards: ${cards.length}\n`;
+      text += `  📌 Cards abertos: ${cards.length}\n`;
       text += `  🏷️ Labels: ${labels.length}\n`;
       text += `  👥 Membros: ${members.length}\n\n`;
-      
-      if (format === "json") {
-        text += `📄 **JSON exportado (em memória)**\n`;
-        text += `Use a API diretamente para baixar o arquivo completo.`;
-      }
-      
-      return { content: [{ type: "text", text }] };
+      text += `O conteúdo exportado está no bloco seguinte.`;
+
+      return { content: [{ type: "text", text }, { type: "text", text: data }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -4037,7 +3432,7 @@ server.tool(
   "Cria um novo quadro a partir de um template",
   {
     name: z.string().describe("Nome do novo quadro"),
-    templateId: z.string().optional().describe("ID do template (opcional)"),
+    templateId: trelloId.optional().describe("ID do template (opcional)"),
     description: z.string().optional().describe("Descrição do quadro")
   },
   async ({ name, templateId, description }) => {
@@ -4062,6 +3457,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -4073,7 +3469,7 @@ server.tool(
   "Obtém as ações/atividades recentes de um quadro",
   {
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
-    limit: z.number().optional().describe("Limite de resultados (padrão: 20)")
+    limit: z.number().int().min(1).max(1000).optional().describe("Limite de resultados (padrão: 20)")
   },
   async ({ boardUrl, limit = 20 }) => {
     const creds = getCredentials();
@@ -4122,6 +3518,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }
@@ -4133,7 +3530,7 @@ server.tool(
   "Obtém estatísticas de atividade do quadro",
   {
     boardUrl: z.string().optional().describe("URL ou nome do quadro (opcional)"),
-    days: z.number().optional().describe("Dias de histórico (padrão: 30)")
+    days: z.number().int().min(1).max(365).optional().describe("Dias de histórico (padrão: 30)")
   },
   async ({ boardUrl, days = 30 }) => {
     const creds = getCredentials();
@@ -4142,7 +3539,7 @@ server.tool(
     try {
       const actions = await fetchTrelloWithCreds<TrelloAction[]>(
         creds, 
-        `/boards/${boardId}/actions?limit=1000&date=${new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split("T")[0]}`
+        `/boards/${boardId}/actions?limit=1000&since=${new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString()}`
       );
       
       const board = await fetchTrelloWithCreds<{ name: string }>(creds, `/boards/${boardId}?fields=name`);
@@ -4177,6 +3574,7 @@ server.tool(
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: "text", text: `❌ Erro: ${error instanceof Error ? error.message : "Erro"}` }],
       };
     }

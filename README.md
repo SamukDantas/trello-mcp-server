@@ -1,9 +1,9 @@
 # Trello MCP Server
 
-Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io) para integração completa com o Trello. Gerencie quadros, listas, cards, labels, checklists, comentários, membros, anexos, campos personalizados, webhooks e automações diretamente de assistentes de IA: **Claude Code, Claude Desktop, OpenCode** ou qualquer cliente MCP via stdio.
+Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io) para integração completa com o Trello. Gerencie quadros, listas, cards, labels, checklists, comentários, membros, anexos, campos personalizados e webhooks diretamente de assistentes de IA: **Claude Code, Claude Desktop, OpenCode** ou qualquer cliente MCP via stdio.
 
-- **79 ferramentas**, cobrindo boards, listas, cards, labels, checklists, datas, membros, anexos, busca, votos, estatísticas, atividades, power-ups, webhooks, automação e campos personalizados
-- **96 testes automatizados** com clientes MCP em memória e via stdio, com respostas do Trello simuladas (sem credenciais nem quadros reais)
+- **78 ferramentas**, cobrindo boards, listas, cards, labels, checklists, datas, membros, anexos, busca, votos, estatísticas, atividades, power-ups, webhooks e campos personalizados
+- **135 testes automatizados** com clientes MCP em memória e via stdio, com respostas do Trello simuladas (sem credenciais nem quadros reais)
 - TypeScript estrito, SDK oficial do MCP e validação de parâmetros com Zod
 
 ## Índice
@@ -14,8 +14,9 @@ Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io) para in
 4. [Uso nos clientes MCP](#uso-nos-clientes-mcp)
 5. [Todas as Funções](#todas-as-funções)
 6. [Exemplos de Uso](#exemplos-de-uso)
-7. [Solução de Problemas](#solução-de-problemas)
-8. [Desenvolvimento e validação](#desenvolvimento-e-validação)
+7. [Segurança](#segurança)
+8. [Solução de Problemas](#solução-de-problemas)
+9. [Desenvolvimento e validação](#desenvolvimento-e-validação)
 
 ---
 
@@ -56,6 +57,11 @@ coluna, ordem de listas ou etiqueta determina o fluxo. O `boardId` define soment
 o quadro padrão; `boardUrl` e `trello_set_board` permitem escolher outro quadro.
 
 > Este arquivo contém credenciais: não o versione. O `.gitignore` do projeto já ignora `*-config.json`.
+
+As variáveis de ambiente `TRELLO_API_KEY` e `TRELLO_TOKEN`, quando definidas, têm precedência sobre
+`apiKey` e `token` do arquivo. Com as duas definidas, o arquivo pode conter apenas `boardId` (ou nem existir),
+e as credenciais não precisam ficar em disco. O `boardId` é opcional: sem ele, informe `boardUrl` nas chamadas
+ou use `trello_set_board`.
 
 ---
 
@@ -155,7 +161,7 @@ Depois de configurar, reinicie o cliente. Para validar as credenciais, peça ao 
 | `trello_set_board` | Define o quadro ativo para operações |
 | `trello_create_board` | Cria um novo quadro |
 | `trello_update_board` | Atualiza um quadro existente |
-| `trello_delete_board` | Exclui um quadro |
+| `trello_delete_board` | Arquiva um quadro; com `permanent: true` e `confirm: true`, exclui em definitivo |
 
 ### Listas
 
@@ -165,7 +171,7 @@ Depois de configurar, reinicie o cliente. Para validar as credenciais, peça ao 
 | `trello_list_cards_in_list` | Lista cards de uma lista específica |
 | `trello_create_list` | Cria uma nova lista |
 | `trello_update_list` | Atualiza uma lista |
-| `trello_delete_list` | Exclui uma lista |
+| `trello_delete_list` | Arquiva uma lista; com `permanent: true` e `confirm: true`, exclui a lista e seus cards em definitivo |
 
 ### Cards (Tarefas)
 
@@ -227,7 +233,7 @@ Após atualizar o código, execute `npm run build` e reinicie a conexão MCP no 
 |--------|------------|
 | `trello_list_board_members` | Lista membros do quadro |
 | `trello_add_board_member` | Adiciona membro ao quadro |
-| `trello_remove_board_member` | Remove membro do quadro |
+| `trello_remove_board_member` | Remove membro do quadro, por `memberId`, `@username` ou nome completo exato |
 | `trello_list_card_members` | Lista membros de um card |
 | `trello_add_card_member` | Adiciona membro ao card |
 | `trello_remove_card_member` | Remove membro do card |
@@ -245,10 +251,10 @@ Após atualizar o código, execute `npm run build` e reinicie a conexão MCP no 
 
 | Função | Descrição |
 |--------|------------|
-| `trello_search_cards` | Busca cards por termo |
+| `trello_search_cards` | Busca cards abertos por texto no título ou na descrição, em um quadro ou em todos |
 | `trello_search_by_label` | Busca cards por label |
-| `trello_search_by_due` | Busca cards por data de vencimento |
-| `trello_search_in_board` | Pesquisa avançada no quadro |
+| `trello_search_by_due` | Busca cards por vencimento: `overdue`, `due_soon`, `no_due` ou `all` (concluídos não contam como atrasados) |
+| `trello_search_in_board` | Busca no título e na descrição dos cards visíveis de um quadro, com `limit` de resultados |
 
 ### Votações
 
@@ -276,9 +282,13 @@ Após atualizar o código, execute `npm run build` e reinicie a conexão MCP no 
 
 | Função | Descrição |
 |--------|------------|
-| `trello_list_power_ups` | Lista Power-Ups do quadro |
-| `trello_enable_power_up` | Ativa Power-Up |
-| `trello_disable_power_up` | Desativa Power-Up |
+| `trello_list_power_ups` | Lista Power-Ups ativados, com IDs; `search` procura entre os disponíveis |
+| `trello_enable_power_up` | Ativa Power-Up pelo ID (ver nota abaixo) |
+| `trello_disable_power_up` | Desativa Power-Up pelo ID (ver nota abaixo) |
+
+> A API pública do Trello marca como obsoletas as rotas de ativar e desativar Power-Ups e pode recusá-las (403)
+> para tokens de API. Nesse caso a ferramenta devolve um erro explicando que a alteração deve ser feita no menu
+> Power-Ups do quadro. A listagem funciona normalmente.
 
 ### Webhooks
 
@@ -288,17 +298,11 @@ Após atualizar o código, execute `npm run build` e reinicie a conexão MCP no 
 | `trello_create_webhook` | Cria um webhook |
 | `trello_delete_webhook` | Exclui um webhook |
 
-### Automação
-
-| Função | Descrição |
-|--------|------------|
-| `trello_create_automation` | Cria automação (Butler) |
-
 ### Export e Templates
 
 | Função | Descrição |
 |--------|------------|
-| `trello_export_board` | Exporta quadro para JSON |
+| `trello_export_board` | Devolve listas, cards abertos, labels e membros em JSON, ou CSV com uma linha por card |
 | `trello_create_from_template` | Cria quadro a partir de template |
 
 ### Recursos nativos adicionais
@@ -342,7 +346,7 @@ checkbox recebe booleano; date recebe ISO 8601 com fuso (por exemplo,
 outros tipos não aceitam opções. O campo deve pertencer ao quadro do card.
 
 Campos personalizados dependem da disponibilidade do recurso e das permissões
-no quadro do Trello. As ferramentas retornam falhas com `isError: true`.
+no quadro do Trello. Todas as ferramentas retornam falhas com `isError: true`.
 Restaurar um card preserva sua lista original; se a lista estiver arquivada, ela
 precisa ser reaberta no Trello para voltar a aparecer no quadro. Acompanhar afeta
 somente o usuário autenticado e segue as regras de notificações do Trello.
@@ -418,7 +422,7 @@ trello_search_cards query="bug"
 trello_search_by_label labelName="Urgente"
 
 # Buscar cards atrasados
-trello_search_by_due overdue=true
+trello_search_by_due filter="overdue"
 ```
 
 ### Estatísticas
@@ -463,6 +467,30 @@ trello_create_from_template name="Novo Projeto" templateId="id_do_template"
 
 ---
 
+## Segurança
+
+- **Credenciais fora da URL.** A chave e o token seguem no cabeçalho `Authorization`, não na query string, e são
+  removidos das mensagens de erro. Prefira as variáveis de ambiente `TRELLO_API_KEY` e `TRELLO_TOKEN` ao arquivo.
+- **IDs validados.** Todo parâmetro de ID aceita somente letras e números. Valores como `../boards/x` ou
+  `abc?closed=true` são recusados antes de qualquer requisição, e o servidor só chama caminhos da API formados
+  por segmentos alfanuméricos.
+- **Seleção por nome sem ambiguidade.** Cards, quadros, labels, checklists e itens são localizados pelo nome exato
+  ou por um trecho que identifique um único item. Se houver mais de um candidato, a ferramenta falha e lista os
+  IDs em vez de escolher o primeiro. `trello_delete_card`, `trello_update_card`, `trello_delete_label`, os nomes de
+  labels em cards e a exclusão permanente de quadros exigem o nome exato.
+- **Exclusões definitivas pedem confirmação.** `trello_delete_board` e `trello_delete_list` arquivam por padrão;
+  a exclusão permanente exige `permanent: true` e `confirm: true`. As operações em lote também exigem `confirm: true`.
+- **Entradas sensíveis.** `trello_create_webhook` aceita apenas URLs HTTPS, `trello_add_board_member` exige email
+  válido e `trello_upload_attachment` aceita apenas URLs http(s). Um webhook envia toda a atividade do quadro para
+  a URL informada: crie-o somente para destinos que você controla.
+- **Token.** Um token com `expiration=never` e escopo `read,write` dá acesso permanente de escrita a todos os seus
+  quadros. Se o uso for apenas de consulta, gere o token com `scope=read`; revogue, nas configurações da
+  sua conta do Trello, os tokens que não usa mais.
+- **CSV.** A exportação em CSV prefixa com apóstrofo as células iniciadas por `=`, `+`, `-` ou `@`, para que
+  planilhas não as executem como fórmulas.
+
+---
+
 ## Solução de Problemas
 
 ### Erro: "fetch failed" / falha HTTPS
@@ -492,6 +520,7 @@ Falhas de rede agora informam o código da causa (por exemplo, `UNABLE_TO_VERIFY
 
 - Tente usar o parâmetro `cardId` em vez de `cardName`
 - Verifique se o card está no quadro correto
+- Se a mensagem disser que o nome é ambíguo, use um dos IDs listados no próprio erro
 
 ### Funções não aparecem no cliente MCP
 
@@ -520,7 +549,7 @@ npm test
 
 Os testes usam clientes MCP em memória e via stdio, com respostas Trello simuladas.
 Não precisam de credenciais nem acessam quadros reais. Após compilar, reinicie o
-cliente MCP para carregar as novas ferramentas. O servidor expõe 79 ferramentas.
+cliente MCP para carregar as novas ferramentas. O servidor expõe 78 ferramentas.
 
 ---
 
