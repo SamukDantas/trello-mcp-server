@@ -17,6 +17,9 @@ const cards = [
   { id: 'd'.repeat(24), name: 'Repetido', idBoard: board, idList: lists[3].id, idLabels: [] },
   { id: 'e'.repeat(24), name: 'Repetido', idBoard: board, idList: lists[3].id, idLabels: [] },
 ];
+// Tests must never see the developer's real credentials.
+delete process.env.TRELLO_API_KEY;
+delete process.env.TRELLO_TOKEN;
 const configPath = path.join(os.homedir(), '.config', 'opencode', 'trello-config.json');
 const originalRead = fs.readFileSync;
 const originalExists = fs.existsSync;

@@ -5,9 +5,10 @@ import { selectList, NamedEntity } from "./selection.js";
 
 /** Explicit operations; legacy names remain available without implicit workflow state. */
 export function registerWorkflowTools(server: McpServer, api: PlatformApi) {
-  const card = { cardId: z.string().trim().min(1).describe("ID do card escolhido") };
+  const id = z.string().trim().regex(/^[A-Za-z0-9]{1,64}$/, "ID do Trello inválido: use apenas letras e números");
+  const card = { cardId: id.describe("ID do card escolhido") };
   const destination = {
-    listId: z.string().trim().min(1).optional().describe("ID da lista escolhida"),
+    listId: id.optional().describe("ID da lista escolhida"),
     listName: z.string().trim().min(1).optional().describe("Nome exato da lista escolhida; use ID para nomes repetidos"),
     boardUrl: z.string().trim().min(1).optional().describe("Quadro da lista; padrão: quadro ativo"),
   };

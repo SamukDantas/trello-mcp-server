@@ -56,7 +56,7 @@ test('operações genéricas no servidor completo, com API e configuração simu
   });
   await check('mover + limpar vencimento preserva todas as alterações', async () => {
     assert.ok(!(await call('trello_update_card', { cardId, listId, due: 'remove', dueComplete: true })).isError);
-    assert.deepEqual(writes()[0].body, { due: null, dueComplete: true, idList: listId, idBoard: boardId });
+    assert.deepEqual(writes()[0].body, { due: '', dueComplete: true, idList: listId, idBoard: boardId });
   });
   for (const tool of ['trello_move_card', 'trello_update_card', 'trello_create_card', 'trello_list_cards_in_list', 'trello_list_pending_backlog_tasks', 'trello_archive_all_cards', 'trello_delete_all_cards', 'trello_update_list', 'trello_delete_list']) {
     for (const listName of ['Repetida', 'Test', 'doing']) await check(`${tool}: rejeita lista ambígua/parcial/inexistente ${listName}`, async () => {
